@@ -477,17 +477,32 @@ report_tns
         """自动查找可用的liberty库文件路径。
         优先顺序：环境变量 OPTIHDL_LIBERTY > 环境变量 LIB > 项目 ./libs/Nangate45_typical.lib > 无
         """
-        # 环境变量
+        # 1) 环境变量
         for env_key in ("OPTIHDL_LIBERTY", "LIB"):
             p = os.environ.get(env_key)
             if p and os.path.exists(p):
-                # 禁用日志输出
                 return p
-        # 项目libs目录
-        candidate = Path.cwd() / "libs" / "Nangate45_typical.lib"
-        if candidate.exists():
-            # 禁用日志输出
-            return str(candidate)
+        
+        # 2) 优先查找与本文件相对的 core_tools/libs
+        try:
+            here = Path(__file__).resolve()
+            # core_tools/ 目录
+            core_dir = here.parent
+            candidate = core_dir / "libs" / "Nangate45_typical.lib"
+            if candidate.exists():
+                return str(candidate)
+            # 仓库根目录下的 core_tools/libs（向上两级再拼 core_tools）
+            repo_root = core_dir.parent
+            candidate2 = repo_root / "core_tools" / "libs" / "Nangate45_typical.lib"
+            if candidate2.exists():
+                return str(candidate2)
+        except Exception:
+            pass
+
+        # 3) 回退：当前工作目录的 libs
+        candidate3 = Path.cwd() / "libs" / "Nangate45_typical.lib"
+        if candidate3.exists():
+            return str(candidate3)
         return None
     
     def cleanup(self):

@@ -15,6 +15,8 @@ import numpy as np
 from loguru import logger
 import sys
 import os
+import re
+from difflib import SequenceMatcher
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core_tools.eda_wrapper import EDAWrapper, analyze_verilog_api
@@ -210,8 +212,13 @@ class RLOptimizer:
         for i in range(self.population_size):
             try:
                 candidate = self._generate_single_candidate(prompt)
-                if candidate and candidate != base_code:
+                if not candidate:
+                    continue
+                if self._is_meaningfully_different(base_code, candidate):
+                    logger.debug(f"候选 {i+1} 长度: {len(candidate)} 字符")
                     candidates.append(candidate)
+                else:
+                    logger.debug(f"候选 {i+1} 与基准过于相似，已丢弃")
             except Exception as e:
                 logger.warning(f"生成候选代码 {i+1} 失败: {e}")
         
@@ -220,11 +227,23 @@ class RLOptimizer:
     
     def _generate_single_candidate(self, prompt: str) -> Optional[str]:
         """生成单个候选代码"""
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-        
+        # 1) 构建输入（支持 chat 模板，如 Qwen 系列）
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            messages = [
+                {"role": "system", "content": "你是精通数字电路和Verilog的资深芯片工程师，目标是优化面积/触发器数/逻辑深度。"},
+                {"role": "user", "content": prompt},
+            ]
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
+        else:
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+
+        input_len = inputs["input_ids"].shape[1]
+
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
+        # 2) 生成，仅解码新增 tokens，避免用字符串切片错位
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
@@ -232,29 +251,30 @@ class RLOptimizer:
                 temperature=self.temperature,
                 do_sample=True,
                 top_p=0.9,
+                top_k=50,
+                repetition_penalty=1.05,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
-        
-        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # 提取生成的代码部分
-        if "优化后的代码：" in generated_text:
-            code_part = generated_text.split("优化后的代码：")[-1].strip()
-        else:
-            code_part = generated_text[len(prompt):].strip()
-        
-        # 简单的代码清理
-        if code_part.startswith("```verilog"):
-            code_part = code_part[10:]
-        if code_part.endswith("```"):
-            code_part = code_part[:-3]
-        
-        return code_part.strip()
+
+        new_tokens = outputs[0][input_len:]
+        if new_tokens.numel() == 0:
+            return None
+        generated_tail = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        # 3) 提取生成的代码部分（优先代码块，其次 module..endmodule）
+        code_part = self._extract_code_block(generated_tail).strip()
+        if not code_part:
+            # 兜底：若模型把“优化后的代码：”重复了，进一步切分
+            if "优化后的代码：" in generated_tail:
+                code_part = generated_tail.split("优化后的代码：")[-1].strip()
+
+        return code_part.strip() or None
     
     def _evaluate_code(self, code: str) -> Dict[str, Any]:
         """评估代码质量"""
-        return analyze_verilog_api(code)
+        module = self._detect_top_module(code) or "top"
+        return analyze_verilog_api(code, module)
     
     def _calculate_score(self, metrics: Dict[str, Any]) -> float:
         """计算综合分数：面积/FF/深度与通过项"""
@@ -305,6 +325,67 @@ class RLOptimizer:
         """清理资源"""
         if hasattr(self, 'eda'):
             self.eda.cleanup()
+
+    # === 辅助方法 ===
+    def _detect_top_module(self, code: str) -> Optional[str]:
+        """从 Verilog 源码中自动检测顶层模块名。
+        策略：
+        1) 去除注释后，匹配第一个 module 声明；
+        2) 若存在名为 top 的模块，则优先返回 top；
+        3) 否则返回第一个模块名；
+        4) 若未找到返回 None。
+        """
+        try:
+            text = re.sub(r"/\*[\s\S]*?\*/", "", code)  # 块注释
+            text = re.sub(r"//.*", "", text)               # 行注释
+            names = re.findall(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+            if not names:
+                return None
+            # 优先 top
+            for n in names:
+                if n == "top" or n.lower() == "top":
+                    return n
+            return names[0]
+        except Exception:
+            return None
+    def _extract_code_block(self, text: str) -> str:
+        """从生成文本中抽取 Verilog 代码块。
+        优先匹配 ```verilog / ```systemverilog 代码块；否则回退匹配 module...endmodule。"""
+        # 1) 三引号代码块
+        fence_matches = list(re.finditer(r"```(?:verilog|systemverilog)?\s*\n([\s\S]*?)\n```", text, flags=re.IGNORECASE))
+        if fence_matches:
+            return fence_matches[-1].group(1).strip()
+
+        # 2) module..endmodule（非贪婪）
+        mod = re.search(r"\bmodule\b[\s\S]*?\bendmodule\b", text, flags=re.IGNORECASE)
+        if mod:
+            return mod.group(0).strip()
+
+        # 3) 直接返回原文（可能模型已只输出代码）
+        return text.strip()
+
+    def _normalize_code(self, code: str) -> str:
+        """对 Verilog 代码做轻度归一化：去注释、压缩多空白。"""
+        # 去掉 // 行注释
+        code = re.sub(r"//.*", "", code)
+        # 去掉 /* */ 块注释
+        code = re.sub(r"/\*[\s\S]*?\*/", "", code)
+        # 压缩空白
+        code = re.sub(r"\s+", " ", code).strip()
+        return code
+
+    def _is_meaningfully_different(self, base: str, cand: str, threshold: float = 0.98) -> bool:
+        """判断候选是否与基准存在“有意义差异”。
+        使用归一化后的相似度，默认阈值为 0.98（越接近1越相似）。"""
+        base_n = self._normalize_code(base)
+        cand_n = self._normalize_code(cand)
+        if not cand_n:
+            return False
+        # 完全相等直接拒绝
+        if base_n == cand_n:
+            return False
+        sim = SequenceMatcher(a=base_n, b=cand_n).ratio()
+        return sim < threshold
 
 
 def main():
