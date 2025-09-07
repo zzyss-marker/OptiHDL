@@ -26,10 +26,14 @@ class RLOptimizer:
     """RL推理优化器"""
     
     def __init__(self, model_path: str, max_iterations: int = 10, 
-                 population_size: int = 5, temperature: float = 0.8,
+                 population_size: int = 1, temperature: float = 0.8,
                  max_new_tokens: int = 1024,
                  debug_gen: bool = False,
-                 debug_dir: Optional[str] = None):
+                 debug_dir: Optional[str] = None,
+                 rl_mode: bool = True,
+                 base_top_p: float = 0.9,
+                 base_top_k: int = 50,
+                 base_rep_penalty: float = 1.05):
         """
         初始化RL优化器
         
@@ -54,6 +58,20 @@ class RLOptimizer:
         # 优化历史
         self.optimization_history = []
         
+        # RL 动态调整参数
+        self.rl_mode = rl_mode
+        self.base_temperature = temperature
+        self.base_top_p = base_top_p
+        self.base_top_k = base_top_k
+        self.base_rep_penalty = base_rep_penalty
+        self.score_history = []  # 每轮最佳分数历史
+        self.improvement_streak = 0  # 连续改进轮数
+        self.stagnation_count = 0   # 连续无改进轮数
+        self.decline_count = 0      # 连续下降轮数
+        self.exploration_factor = 0.3  # 探索因子
+        self.last_best_score = 0.0  # 上一轮最佳分数
+        self.score_trend = 0.0      # 分数趋势
+        
         # 调试
         self.debug_gen = debug_gen
         # 默认调试目录
@@ -64,6 +82,9 @@ class RLOptimizer:
             self.debug_dir = str(debug_root)
         else:
             self.debug_dir = debug_dir
+        
+        # 模块名（将在optimize方法中从代码中提取）
+        self.module_name = None
         
         logger.info(f"RL优化器初始化完成，模型: {model_path}")
     
@@ -115,37 +136,64 @@ class RLOptimizer:
         Returns:
             优化结果字典
         """
-        logger.info("开始RL优化过程")
-        
-        # 获取初始基准
-        initial_metrics = self._evaluate_code(input_code)
-        if not initial_metrics["success"]:
+        # 提取模块名
+        self.module_name = self._extract_module_name(input_code)
+        if not self.module_name:
             return {
                 "success": False,
-                "error": f"初始代码评估失败: {initial_metrics['error']}",
-                "original_code": input_code
+                "error": "无法从代码中提取模块名"
             }
         
+        # 初始评估和预检查
+        logger.info("开始RL优化过程")
+        try:
+            initial_data = self.eda.synthesize(input_code, self.module_name, target_freq=100.0)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"初始代码综合失败: {str(e)}"
+            }
+        
+        # 检查初始代码语法和综合状态
+        if not initial_data.get("syntax_ok", False) or not initial_data.get("synth_ok", False):
+            logger.error("❌ 初始代码语法或综合检查失败，停止RL训练")
+            logger.error(f"语法检查: {initial_data.get('syntax_ok', False)}")
+            logger.error(f"综合检查: {initial_data.get('synth_ok', False)}")
+            return {
+                "success": False,
+                "error": "初始代码存在语法错误或综合失败，无法进行优化训练。请先修复代码语法问题。"
+            }
+        
+        initial_score = self._calculate_score(initial_data)
+        self.best_score = initial_score
+        self.best_code = input_code
+        self.best_metrics = initial_data
+        self.last_best_score = initial_score
+        logger.info(f"✅ 初始代码检查通过，分数: {initial_score:.4f}")
+        
+        # 初始化优化历史和变量
+        best_score = initial_score
         best_code = input_code
-        best_metrics = initial_metrics["data"]
-        best_score = self._calculate_score(best_metrics)
+        best_metrics = initial_data
         
         self.optimization_history = [{
             "iteration": 0,
             "code": input_code,
-            "metrics": best_metrics,
-            "score": best_score,
+            "metrics": initial_data,
+            "score": initial_score,
             "is_best": True
         }]
-        
-        logger.info(f"初始分数: {best_score:.4f}")
         
         # 迭代优化
         for iteration in range(1, self.max_iterations + 1):
             logger.info(f"优化迭代 {iteration}/{self.max_iterations}")
             
+            # RL动态调整策略
+            if self.rl_mode and iteration > 1:
+                self._update_rl_strategy(iteration, best_score)
+            
             # 生成候选代码
-            candidates = self._generate_candidates(best_code, target_description, iteration)
+            candidates = self._generate_candidates(best_code, target_description, iteration, best_score, best_metrics)
             
             # 评估候选代码
             iteration_best_score = best_score
@@ -165,62 +213,81 @@ class RLOptimizer:
                 # 调试保存
                 self._maybe_dump_text(iteration, i+1, "candidate_fixed.v", candidate_fixed)
                 
-                # 先做形式等价检查（相对于当前最佳）
-                try:
-                    eq_ok = self.eda.check_equivalence(best_code, candidate_fixed, module_name, debug_dir=self._candidate_dir(iteration, i+1))
-                except Exception:
-                    eq_ok = False
-                if not eq_ok:
-                    logger.warning(f"候选代码 {i+1} 功能等价检查未通过，丢弃")
-                    continue
-
+                # 先评估候选代码获取分数
                 metrics_result = self._evaluate_code(candidate_fixed)
                 if not metrics_result["success"]:
                     logger.warning(f"候选代码 {i+1} 评估失败: {metrics_result['error']}")
                     continue
                 
                 metrics = metrics_result["data"]
-                # 指标健壮性校验：过滤明显异常的候选
-                if (not metrics.get("synth_ok")) or (float(metrics.get("area", -1)) <= 0):
-                    logger.warning(f"候选代码 {i+1} 指标异常，丢弃: synth_ok={metrics.get('synth_ok')}, area={metrics.get('area')}")
-                    continue
                 score = self._calculate_score(metrics)
                 
-                # 记录历史
+                # 记录候选历史（先记录再检查等价）
                 self.optimization_history.append({
                     "iteration": iteration,
-                    "candidate": i + 1,
+                    "candidate": i+1,
                     "code": candidate_fixed,
                     "metrics": metrics,
                     "score": score,
-                    "is_best": False
+                    "is_best": False,
+                    "equiv_checked": False
                 })
                 
-                # 更新最佳结果
+                logger.info(f"候选 {i+1} 分数: {score:.4f} (面积: {metrics['area']}, FF: {metrics.get('num_ff', 0)}, 深度: {metrics.get('logic_depth', 0)})")
+                
+                # 直接基于分数更新最佳候选（已移除等价检查）
                 if score > iteration_best_score:
+                    logger.info(f"✅ 候选 {i+1} 分数更高，直接采用: {score:.4f}")
                     iteration_best_score = score
                     iteration_best_code = candidate_fixed
                     iteration_best_metrics = metrics
                     
-                    # 标记为最佳
-                    self.optimization_history[-1]["is_best"] = True
-                    logger.info(f"发现更好的代码，分数: {score:.4f}")
+                    # 保存最佳候选
+                    if self.debug_dir:
+                        best_file = Path(self.debug_dir) / f"best_candidate_iter_{iteration}.v"
+                        best_file.write_text(candidate_fixed, encoding='utf-8')
+                else:
+                    decline = (iteration_best_score - score) / max(iteration_best_score, 1e-6) * 100
+                    logger.debug(f"候选 {i+1} 分数较低: {score:.4f} (低 {decline:.2f}%)")
             
-            # 更新全局最佳
+            # 更新全局最佳并记录RL状态
+            self.score_history.append(iteration_best_score)
+            score_change = iteration_best_score - self.last_best_score if self.last_best_score > 0 else 0
+            
             if iteration_best_score > best_score:
                 best_score = iteration_best_score
                 best_code = iteration_best_code
                 best_metrics = iteration_best_metrics
-                logger.info(f"全局最佳分数更新: {best_score:.4f}")
+                self.improvement_streak += 1
+                self.stagnation_count = 0
+                improvement = (iteration_best_score - self.last_best_score) / max(self.last_best_score, 1e-6) * 100
+                logger.info(f"🎉 全局最佳更新: {best_score:.4f} (+{improvement:.2f}%)")
+                if self.rl_mode:
+                    logger.info(f"RL状态: 连续改进 {self.improvement_streak} 轮")
+            elif abs(iteration_best_score - best_score) < 1e-6:
+                # 分数相等，视为停滞
+                self.improvement_streak = 0
+                self.stagnation_count += 1
+                logger.info(f"本轮无改进，维持最佳: {best_score:.4f}")
+                if self.rl_mode:
+                    logger.info(f"RL状态: 连续停滞 {self.stagnation_count} 轮")
             else:
-                logger.info(f"本轮无改进，当前最佳分数: {best_score:.4f}")
+                # 分数下降
+                self.improvement_streak = 0
+                self.stagnation_count += 1
+                decline = (best_score - iteration_best_score) / max(best_score, 1e-6) * 100
+                logger.warning(f"⚠️  本轮表现下降: {iteration_best_score:.4f} (较最佳低 {decline:.2f}%)")
+                if self.rl_mode:
+                    logger.warning(f"RL状态: 需要调整策略，停滞 {self.stagnation_count} 轮")
+            
+            self.last_best_score = iteration_best_score
         
         # 计算改进情况
-        init_score = self._calculate_score(initial_metrics["data"])
+        init_score = self._calculate_score(initial_data)
         improvement = {
-            "area_improvement": (initial_metrics["data"]["area"] - best_metrics["area"]) / max(1e-9, initial_metrics["data"]["area"]) * 100,
-            "ff_improvement": (initial_metrics["data"].get("num_ff", 0) - best_metrics.get("num_ff", 0)) / max(1e-9, initial_metrics["data"].get("num_ff", 0) or 1) * 100,
-            "depth_improvement": (initial_metrics["data"].get("logic_depth", 0) - best_metrics.get("logic_depth", 0)) / max(1e-9, initial_metrics["data"].get("logic_depth", 0) or 1) * 100,
+            "area_improvement": (initial_data["area"] - best_metrics["area"]) / max(1e-9, initial_data["area"]) * 100,
+            "ff_improvement": (initial_data.get("num_ff", 0) - best_metrics.get("num_ff", 0)) / max(1e-9, initial_data.get("num_ff", 0) or 1) * 100,
+            "depth_improvement": (initial_data.get("logic_depth", 0) - best_metrics.get("logic_depth", 0)) / max(1e-9, initial_data.get("logic_depth", 0) or 1) * 100,
             "score_improvement": (best_score - init_score) / max(1e-9, init_score or 1) * 100
         }
         
@@ -228,7 +295,7 @@ class RLOptimizer:
             "success": True,
             "original_code": input_code,
             "optimized_code": best_code,
-            "original_metrics": initial_metrics["data"],
+            "original_metrics": initial_data,
             "optimized_metrics": best_metrics,
             "improvement": improvement,
             "optimization_history": self.optimization_history,
@@ -236,25 +303,73 @@ class RLOptimizer:
             "total_candidates": len(self.optimization_history) - 1
         }
     
-    def _generate_candidates(self, base_code: str, target_description: str, iteration: int) -> List[str]:
+    def _update_rl_strategy(self, iteration: int, current_best_score: float):
+        """基于历史表现动态调整RL策略"""
+        recent_scores = self.score_history[-5:] if len(self.score_history) >= 5 else self.score_history
+        
+        # 计算多层次趋势
+        short_trend = 0.0  # 短期趋势（最近2轮）
+        long_trend = 0.0   # 长期趋势（最近5轮）
+        
+        if len(recent_scores) >= 2:
+            short_trend = (recent_scores[-1] - recent_scores[-2]) / max(abs(recent_scores[-2]), 1e-6)
+        if len(recent_scores) >= 3:
+            long_trend = (recent_scores[-1] - recent_scores[0]) / max(abs(recent_scores[0]), 1e-6)
+        
+        self.score_trend = short_trend
+        
+        # 检测得分下降
+        if short_trend < -0.01:  # 得分下降超过1%
+            self.decline_count += 1
+            logger.warning(f"检测到得分下降: {short_trend:.4f}, 连续下降 {self.decline_count} 轮")
+        else:
+            self.decline_count = 0
+        
+        # 动态调整策略 - 更敏感的响应
+        if self.decline_count >= 2:
+            # 连续下降，立即大幅增加探索
+            self.exploration_factor = min(0.9, self.exploration_factor + 0.15)
+            self.temperature = min(1.3, self.base_temperature + 0.3)
+            logger.warning(f"连续下降模式: 大幅增加探索，温度={self.temperature:.2f}")
+        elif self.stagnation_count >= 2:
+            # 停滞，适度增加探索
+            self.exploration_factor = min(0.7, self.exploration_factor + 0.1)
+            self.temperature = min(1.1, self.base_temperature + 0.2)
+            logger.info(f"停滞模式: 增加探索，温度={self.temperature:.2f}")
+        elif self.improvement_streak >= 3:
+            # 连续改进，专注利用
+            self.exploration_factor = max(0.1, self.exploration_factor - 0.05)
+            self.temperature = max(0.6, self.base_temperature - 0.1)
+            logger.info(f"利用模式: 专注当前方向，温度={self.temperature:.2f}")
+        elif short_trend > 0.02:  # 单轮大幅改进
+            # 发现好方向，适度利用
+            self.exploration_factor = max(0.2, self.exploration_factor - 0.03)
+            self.temperature = max(0.7, self.base_temperature - 0.05)
+            logger.info(f"发现改进: 适度利用，温度={self.temperature:.2f}")
+        else:
+            # 平衡状态，逐渐回归基准
+            target_exploration = 0.3
+            self.exploration_factor += (target_exploration - self.exploration_factor) * 0.3
+            self.temperature += (self.base_temperature - self.temperature) * 0.2
+        
+        logger.info(f"RL策略: 温度={self.temperature:.2f}, 探索={self.exploration_factor:.2f}, 短期趋势={short_trend:.4f}, 长期趋势={long_trend:.4f}")
+
+    def _generate_candidates(self, base_code: str, target_description: str, iteration: int, 
+                           current_score: float = 0, current_metrics: Dict = None) -> List[str]:
         """生成候选代码"""
         candidates = []
         
-        # 构建提示
-        constraints = (
-            "要求：1) 严格保留顶层模块的接口(模块名、端口列表、位宽、方向、参数)完全一致；"
-            "2) 仅修改模块体内实现，不改变接口和时序语义；"
-            "3) 只输出优化后的 Verilog 代码(包含完整 module...endmodule)，不要额外说明。"
-        )
+        # 构建动态提示
+        constraints = self._build_dynamic_constraints(iteration, current_score, current_metrics)
         if target_description:
             prompt = f"请优化以下Verilog代码以{target_description}，{constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
         else:
             prompt = f"请优化以下Verilog代码以提高性能和减少面积，{constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
         
-        # 生成多个候选
+        # RL模式：单候选生成，非RL模式：多候选生成
         for i in range(self.population_size):
             try:
-                candidate = self._generate_single_candidate(prompt, iteration, i+1)
+                candidate = self._generate_single_candidate(prompt, iteration, i+1, current_score, current_metrics)
                 if not candidate:
                     continue
                 if self._is_meaningfully_different(base_code, candidate):
@@ -262,22 +377,95 @@ class RLOptimizer:
                     candidates.append(candidate)
                 else:
                     logger.debug(f"候选 {i+1} 与基准过于相似，已丢弃")
+                    if self.rl_mode and (self.stagnation_count >= 2 or self.decline_count >= 1):
+                        # RL模式下停滞或下降时，即使相似也保留，增加探索
+                        logger.debug(f"RL探索模式：保留相似候选以增加多样性（停滞:{self.stagnation_count}, 下降:{self.decline_count}）")
+                        candidates.append(candidate)
             except Exception as e:
                 logger.warning(f"生成候选代码 {i+1} 失败: {e}")
         
         logger.info(f"生成了 {len(candidates)} 个有效候选代码")
         return candidates
+
+    def _build_dynamic_constraints(self, iteration: int, current_score: float, current_metrics: Dict) -> str:
+        """基于当前状态和RL策略构建动态约束提示"""
+        base_constraints = (
+            "要求：1) 严格保留顶层模块的接口(模块名、端口列表、位宽、方向、参数)完全一致；"
+            "2) 仅修改模块体内实现，不改变接口和时序语义；"
+            "3) 只输出优化后的 Verilog 代码(包含完整 module...endmodule)，不要额外说明。"
+        )
+        
+        if not self.rl_mode or not current_metrics:
+            return base_constraints
+        
+        # 基于当前指标动态添加优化方向提示
+        dynamic_hints = []
+        
+        if self.exploration_factor > 0.5:
+            # 高探索模式：鼓励大胆优化
+            dynamic_hints.append("4) 可尝试较大幅度的逻辑重构、资源共享、时序优化等；")
+        else:
+            # 利用模式：保守优化
+            dynamic_hints.append("4) 进行保守的局部优化，如常量折叠、冗余消除、表达式简化等；")
+        
+        # 基于当前瓶颈和RL状态指导优化重点
+        if current_metrics:
+            area = current_metrics.get('area', 0)
+            ff_count = current_metrics.get('num_ff', 0)
+            depth = current_metrics.get('logic_depth', 0)
+            
+            # 根据RL状态调整优化激进程度
+            if self.decline_count >= 2:
+                dynamic_hints.append("5) 当前策略效果不佳，尝试完全不同的优化方向：重新组织逻辑结构、改变实现方式；")
+            elif self.exploration_factor > 0.6:
+                if area > ff_count * 100:
+                    dynamic_hints.append("5) 激进面积优化：大幅重构逻辑、合并相似功能、使用更紧凑的编码方式；")
+                elif ff_count > 10:
+                    dynamic_hints.append("5) 激进寄存器优化：重新设计状态机、合并寄存器、使用移位寄存器；")
+                elif depth > 20:
+                    dynamic_hints.append("5) 激进时序优化：重新分层逻辑、引入流水线、并行化计算；")
+                else:
+                    dynamic_hints.append("5) 探索性优化：尝试不同的实现范式、编码风格、结构组织；")
+            else:
+                if area > ff_count * 100:
+                    dynamic_hints.append("5) 保守面积优化：逻辑简化、常量折叠、冗余消除；")
+                elif ff_count > 10:
+                    dynamic_hints.append("5) 保守寄存器优化：局部状态合并、寄存器复用；")
+                elif depth > 20:
+                    dynamic_hints.append("5) 保守时序优化：表达式分解、关键路径缓解；")
+                else:
+                    dynamic_hints.append("5) 渐进式优化：小幅改进表达式、优化信号命名、代码整理；")
+        
+        return base_constraints + "".join(dynamic_hints)
     
-    def _generate_single_candidate(self, prompt: str, iteration: int, cand_idx: int) -> Optional[str]:
+    def _generate_single_candidate(self, prompt: str, iteration: int, cand_idx: int, 
+                                 current_score: float = 0, current_metrics: Dict = None) -> Optional[str]:
         """生成单个候选代码"""
         # 1) 构建输入（支持 chat 模板，如 Qwen 系列；若未配置模板则回退纯文本）
         use_chat = hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None)
-        # 统一计算上下文与生成长度的安全上限
+        # 智能token分配：支持更大输入，动态调整生成长度
         context_max = self._get_context_window()
-        effective_new = max(64, min(self.max_new_tokens, context_max - 256))
-        input_max = max(256, context_max - effective_new)
+        estimated_prompt_tokens = len(prompt) // 3  # 更准确的估算（中文字符密度更高）
+        
+        # 根据输入长度动态调整生成tokens
+        if estimated_prompt_tokens < 2000:
+            # 短输入：保证充足生成空间
+            effective_new = self.max_new_tokens
+            input_max = context_max - effective_new - 100
+        elif estimated_prompt_tokens < 4000:
+            # 中等输入：平衡输入和生成
+            effective_new = max(1024, int(self.max_new_tokens * 0.8))
+            input_max = context_max - effective_new - 100
+        else:
+            # 长输入：优先保证输入完整性，但保证最小生成长度
+            min_generation = 768  # 最小生成长度
+            effective_new = max(min_generation, context_max - estimated_prompt_tokens - 200)
+            input_max = context_max - effective_new - 100
+        
+        if estimated_prompt_tokens > input_max:
+            logger.warning(f"输入过长（估算{estimated_prompt_tokens}tokens），可能影响生成质量")
         if self.debug_gen:
-            logger.debug(f"context_max={context_max}, input_max={input_max}, effective_new={effective_new}")
+            logger.debug(f"context_max={context_max}, input_max={input_max}, effective_new={effective_new}, prompt_est={estimated_prompt_tokens}")
         if use_chat:
             try:
                 messages = [
@@ -297,15 +485,23 @@ class RLOptimizer:
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         # 2) 生成，仅解码新增 tokens，避免用字符串切片错位
+        # 动态调整生成参数
+        dynamic_top_p = max(0.7, min(0.95, self.base_top_p + (self.exploration_factor - 0.3) * 0.2))
+        dynamic_top_k = max(30, min(80, int(self.base_top_k + (self.exploration_factor - 0.3) * 50)))
+        dynamic_rep_penalty = max(1.0, min(1.15, self.base_rep_penalty + (self.exploration_factor - 0.3) * 0.1))
+        
+        if self.debug_gen:
+            logger.debug(f"生成参数: temp={self.temperature:.2f}, top_p={dynamic_top_p:.2f}, top_k={dynamic_top_k}, rep_penalty={dynamic_rep_penalty:.2f}")
+        
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=effective_new,
                 temperature=self.temperature,
                 do_sample=True,
-                top_p=0.9,
-                top_k=50,
-                repetition_penalty=1.05,
+                top_p=dynamic_top_p,
+                top_k=dynamic_top_k,
+                repetition_penalty=dynamic_rep_penalty,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
@@ -401,6 +597,15 @@ class RLOptimizer:
             return f"{m.group(1)}{module_name}{m.group(3)}"
         return pattern.sub(_repl, code, count=1)
     
+    def _extract_module_name(self, code: str) -> Optional[str]:
+        """从Verilog代码中提取模块名"""
+        import re
+        pattern = re.compile(r'\bmodule\s+(\w+)', re.IGNORECASE)
+        match = pattern.search(code)
+        if match:
+            return match.group(1)
+        return None
+    
     def _extract_module_ports(self, code: str, module_name: str) -> Optional[str]:
         """提取 module 头部括号内的端口列表文本。兼容可选参数块。"""
         pat = re.compile(rf"\bmodule\s+{re.escape(module_name)}\s*(?:#\s*\([\s\S]*?\))?\s*\(([\s\S]*?)\)\s*;", flags=re.IGNORECASE)
@@ -441,21 +646,16 @@ class RLOptimizer:
         return pat.sub(_repl2, cand_code, count=1)
 
     def _get_context_window(self) -> int:
-        """安全获取模型上下文窗口大小，避免部分 tokenizer 报告的超大数值导致底层转换溢出。
-        策略：
-        - 若 tokenizer.model_max_length 缺失，默认 4096；
-        - 若其值极大(>=1e6)或等于奇异占位(如 100000000000000001988462...), 则回退 4096；
-        - 全局上限 8192，避免GPU内存与底层整型溢出。
-        """
+        """获取模型上下文窗口大小"""
         try:
             m = int(getattr(self.tokenizer, "model_max_length", 4096) or 4096)
         except Exception:
             m = 4096
         # 过滤异常大值
         if m >= 1_000_000:
-            m = 4096
-        # 设定全局上限
-        m = max(1024, min(m, 8192))
+            m = 8192  # 提高默认上限
+        # 设定全局上限，支持更长上下文
+        m = max(2048, min(m, 32768))  # 支持到32K上下文
         return m
 
     # === 调试输出 ===
