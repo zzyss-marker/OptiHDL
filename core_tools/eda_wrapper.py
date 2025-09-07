@@ -518,6 +518,129 @@ report_tns
             # 禁用日志输出
             pass
 
+    # === 新增：形式等价检查 ===
+    def check_equivalence(self, ref_code: str, cand_code: str, module_name: str, debug_dir: Optional[str] = None) -> bool:
+        """使用 Yosys formal flow 检查候选是否与参考代码功能等价。
+        返回 True 表示等价，False 表示不等价或检查失败。
+        """
+        try:
+            ref_v = self.temp_dir / f"{module_name}_gold.v"
+            cand_v = self.temp_dir / f"{module_name}_gate.v"
+            with open(ref_v, 'w') as f:
+                f.write(ref_code)
+            with open(cand_v, 'w') as f:
+                f.write(cand_code)
+            # 尝试1：规范化 + 等价简单证明（保留memory，归一化不定值）
+            yosys_tcl_1 = f"""
+read_verilog {ref_v}
+hierarchy -check -top {module_name}
+prep -top {module_name}
+proc; opt; memory -nomap; opt; techmap; opt
+splitnets -ports;; design -stash gold
+
+read_verilog {cand_v}
+hierarchy -check -top {module_name}
+prep -top {module_name}
+proc; opt; memory -nomap; opt; techmap; opt
+splitnets -ports;; design -stash gate
+
+design -copy-from gold -as gold {module_name}
+design -copy-from gate -as gate {module_name}
+setundef -undriven -zero
+equiv_make gold gate equiv
+hierarchy -top equiv
+equiv_struct
+equiv_simple
+equiv_status -assert
+"""
+            tcl_file = self.temp_dir / "equiv.ys"
+            with open(tcl_file, 'w') as f:
+                f.write(yosys_tcl_1)
+
+            cmd = [self.yosys_path, "-q", "-s", str(tcl_file)]
+            timeout_s = int(os.environ.get("OPTIHDL_EQUIV_TIMEOUT", "180"))
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            if debug_dir:
+                try:
+                    Path(debug_dir).mkdir(parents=True, exist_ok=True)
+                    (Path(debug_dir) / "equiv_1.tcl").write_text(yosys_tcl_1, encoding='utf-8')
+                    (Path(debug_dir) / "equiv_1.stdout.txt").write_text(result.stdout or "", encoding='utf-8')
+                    (Path(debug_dir) / "equiv_1.stderr.txt").write_text(result.stderr or "", encoding='utf-8')
+                except Exception:
+                    pass
+            if result.returncode == 0:
+                return True
+
+            # 尝试2：等价归纳（更强，但更慢，提升序列深度并处理不定值）
+            yosys_tcl_2 = f"""
+read_verilog {ref_v}
+hierarchy -check -top {module_name}
+prep -top {module_name}
+proc; opt; memory -nomap; opt; techmap; opt
+splitnets -ports;; design -stash gold
+
+read_verilog {cand_v}
+hierarchy -check -top {module_name}
+prep -top {module_name}
+proc; opt; memory -nomap; opt; techmap; opt
+splitnets -ports;; design -stash gate
+
+design -copy-from gold -as gold {module_name}
+design -copy-from gate -as gate {module_name}
+equiv_make gold gate equiv
+hierarchy -top equiv
+setundef -undriven -zero
+equiv_induct -undef -seq 10
+equiv_status -assert
+"""
+            with open(tcl_file, 'w') as f:
+                f.write(yosys_tcl_2)
+            result2 = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            if debug_dir:
+                try:
+                    (Path(debug_dir) / "equiv_2.tcl").write_text(yosys_tcl_2, encoding='utf-8')
+                    (Path(debug_dir) / "equiv_2.stdout.txt").write_text(result2.stdout or "", encoding='utf-8')
+                    (Path(debug_dir) / "equiv_2.stderr.txt").write_text(result2.stderr or "", encoding='utf-8')
+                except Exception:
+                    pass
+            if result2.returncode == 0:
+                return True
+
+            # 尝试3：SAT 基于 miter（提高序列深度，忽略初始未定义）
+            yosys_tcl_3 = f"""
+read_verilog {ref_v}
+hierarchy -check -top {module_name}
+prep -top {module_name}
+proc; opt; memory -nomap; opt; techmap; opt
+splitnets -ports;; design -stash gold
+
+read_verilog {cand_v}
+hierarchy -check -top {module_name}
+prep -top {module_name}
+proc; opt; memory -nomap; opt; techmap; opt
+splitnets -ports;; design -stash gate
+
+design -copy-from gold -as gold {module_name}
+design -copy-from gate -as gate {module_name}
+miter -equiv -flatten gold gate miter
+hierarchy -top miter
+setundef -undriven -zero
+sat -verify -prove-asserts -set-init-undef -seq 10 -ignore_div_by_zero -enable_undef
+"""
+            with open(tcl_file, 'w') as f:
+                f.write(yosys_tcl_3)
+            result3 = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            if debug_dir:
+                try:
+                    (Path(debug_dir) / "equiv_3.tcl").write_text(yosys_tcl_3, encoding='utf-8')
+                    (Path(debug_dir) / "equiv_3.stdout.txt").write_text(result3.stdout or "", encoding='utf-8')
+                    (Path(debug_dir) / "equiv_3.stderr.txt").write_text(result3.stderr or "", encoding='utf-8')
+                except Exception:
+                    pass
+            return result3.returncode == 0
+        except Exception:
+            return False
+
 
 # API接口
 def analyze_verilog_api(code: str, module_name: str = "top", target_freq: float = 100.0) -> Dict[str, Any]:

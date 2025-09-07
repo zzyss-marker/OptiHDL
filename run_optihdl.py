@@ -39,6 +39,9 @@ def main():
     parser.add_argument('--iterations', type=int, default=10, help='最大迭代次数')
     parser.add_argument('--population', type=int, default=5, help='候选代码数量')
     parser.add_argument('--temperature', type=float, default=0.8, help='生成温度')
+    parser.add_argument('--max-new-tokens', type=int, default=1024, help='每次生成的最大新tokens数')
+    parser.add_argument('--debug-gen', action='store_true', help='开启生成与等价检查的调试输出（会将prompt/生成文本/提取代码/等价脚本与日志写入outputs目录）')
+    parser.add_argument('--debug-dir', type=str, help='自定义调试输出目录（默认 outputs/debug_时间戳）')
     parser.add_argument('--output', '-o', help='输出目录（保存优化代码与报告）')
 
     args = parser.parse_args()
@@ -59,6 +62,9 @@ def main():
         max_iterations=args.iterations,
         population_size=args.population,
         temperature=args.temperature,
+        max_new_tokens=args.max_new_tokens,
+        debug_gen=args.debug_gen,
+        debug_dir=args.debug_dir,
     )
     try:
         result = optimizer.optimize(code, args.target)
@@ -82,14 +88,18 @@ def main():
         print(f"触发器数: {orig.get('num_ff', 0)} -> {opt.get('num_ff', 0)}")
         print(f"逻辑深度: {orig.get('logic_depth', 0)} -> {opt.get('logic_depth', 0)}")
 
-        # 保存输出
+        # 保存输出（即使未指定 --output，也默认保存到 outputs/opt_YYYYmmdd_HHMMSS）
+        import time as _time
+        import json as _json
         if args.output:
             out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / 'optimized_code.v').write_text(result['optimized_code'], encoding='utf-8')
-            import json as _json
-            (out_dir / 'optimization_report.json').write_text(_json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
-            print(f"结果已保存到: {out_dir}")
+        else:
+            ts = _time.strftime("%Y%m%d_%H%M%S")
+            out_dir = Path("outputs") / f"opt_{ts}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / 'optimized_code.v').write_text(result['optimized_code'], encoding='utf-8')
+        (out_dir / 'optimization_report.json').write_text(_json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
+        print(f"结果已保存到: {out_dir}")
     else:
         print(f"优化失败: {result.get('error')}")
 

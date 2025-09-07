@@ -26,7 +26,10 @@ class RLOptimizer:
     """RL推理优化器"""
     
     def __init__(self, model_path: str, max_iterations: int = 10, 
-                 population_size: int = 5, temperature: float = 0.8):
+                 population_size: int = 5, temperature: float = 0.8,
+                 max_new_tokens: int = 1024,
+                 debug_gen: bool = False,
+                 debug_dir: Optional[str] = None):
         """
         初始化RL优化器
         
@@ -40,6 +43,7 @@ class RLOptimizer:
         self.max_iterations = max_iterations
         self.population_size = population_size
         self.temperature = temperature
+        self.max_new_tokens = max_new_tokens
         
         # 加载模型
         self.tokenizer, self.model = self._load_model()
@@ -49,6 +53,17 @@ class RLOptimizer:
         
         # 优化历史
         self.optimization_history = []
+        
+        # 调试
+        self.debug_gen = debug_gen
+        # 默认调试目录
+        if debug_dir is None and self.debug_gen:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            debug_root = Path("outputs") / f"debug_{ts}"
+            debug_root.mkdir(parents=True, exist_ok=True)
+            self.debug_dir = str(debug_root)
+        else:
+            self.debug_dir = debug_dir
         
         logger.info(f"RL优化器初始化完成，模型: {model_path}")
     
@@ -130,7 +145,7 @@ class RLOptimizer:
             logger.info(f"优化迭代 {iteration}/{self.max_iterations}")
             
             # 生成候选代码
-            candidates = self._generate_candidates(best_code, target_description)
+            candidates = self._generate_candidates(best_code, target_description, iteration)
             
             # 评估候选代码
             iteration_best_score = best_score
@@ -139,20 +154,43 @@ class RLOptimizer:
             
             for i, candidate in enumerate(candidates):
                 logger.info(f"评估候选代码 {i+1}/{len(candidates)}")
+                # 预处理：确保候选包含完整模块并与基准模块名一致
+                module_name = self._detect_top_module(best_code) or "top"
+                if not self._has_complete_module(candidate):
+                    logger.warning(f"候选代码 {i+1} 缺少完整 module/endmodule，丢弃")
+                    self._maybe_dump_text(iteration, i+1, "extracted_incomplete.v", candidate)
+                    continue
+                candidate_named = self._try_fix_module_name(candidate, module_name)
+                candidate_fixed = self._align_module_header(best_code, candidate_named, module_name)
+                # 调试保存
+                self._maybe_dump_text(iteration, i+1, "candidate_fixed.v", candidate_fixed)
                 
-                metrics_result = self._evaluate_code(candidate)
+                # 先做形式等价检查（相对于当前最佳）
+                try:
+                    eq_ok = self.eda.check_equivalence(best_code, candidate_fixed, module_name, debug_dir=self._candidate_dir(iteration, i+1))
+                except Exception:
+                    eq_ok = False
+                if not eq_ok:
+                    logger.warning(f"候选代码 {i+1} 功能等价检查未通过，丢弃")
+                    continue
+
+                metrics_result = self._evaluate_code(candidate_fixed)
                 if not metrics_result["success"]:
                     logger.warning(f"候选代码 {i+1} 评估失败: {metrics_result['error']}")
                     continue
                 
                 metrics = metrics_result["data"]
+                # 指标健壮性校验：过滤明显异常的候选
+                if (not metrics.get("synth_ok")) or (float(metrics.get("area", -1)) <= 0):
+                    logger.warning(f"候选代码 {i+1} 指标异常，丢弃: synth_ok={metrics.get('synth_ok')}, area={metrics.get('area')}")
+                    continue
                 score = self._calculate_score(metrics)
                 
                 # 记录历史
                 self.optimization_history.append({
                     "iteration": iteration,
                     "candidate": i + 1,
-                    "code": candidate,
+                    "code": candidate_fixed,
                     "metrics": metrics,
                     "score": score,
                     "is_best": False
@@ -161,7 +199,7 @@ class RLOptimizer:
                 # 更新最佳结果
                 if score > iteration_best_score:
                     iteration_best_score = score
-                    iteration_best_code = candidate
+                    iteration_best_code = candidate_fixed
                     iteration_best_metrics = metrics
                     
                     # 标记为最佳
@@ -198,20 +236,25 @@ class RLOptimizer:
             "total_candidates": len(self.optimization_history) - 1
         }
     
-    def _generate_candidates(self, base_code: str, target_description: str) -> List[str]:
+    def _generate_candidates(self, base_code: str, target_description: str, iteration: int) -> List[str]:
         """生成候选代码"""
         candidates = []
         
         # 构建提示
+        constraints = (
+            "要求：1) 严格保留顶层模块的接口(模块名、端口列表、位宽、方向、参数)完全一致；"
+            "2) 仅修改模块体内实现，不改变接口和时序语义；"
+            "3) 只输出优化后的 Verilog 代码(包含完整 module...endmodule)，不要额外说明。"
+        )
         if target_description:
-            prompt = f"请优化以下Verilog代码以{target_description}：\n{base_code}\n\n优化后的代码："
+            prompt = f"请优化以下Verilog代码以{target_description}，{constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
         else:
-            prompt = f"请优化以下Verilog代码以提高性能和减少面积：\n{base_code}\n\n优化后的代码："
+            prompt = f"请优化以下Verilog代码以提高性能和减少面积，{constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
         
         # 生成多个候选
         for i in range(self.population_size):
             try:
-                candidate = self._generate_single_candidate(prompt)
+                candidate = self._generate_single_candidate(prompt, iteration, i+1)
                 if not candidate:
                     continue
                 if self._is_meaningfully_different(base_code, candidate):
@@ -225,18 +268,28 @@ class RLOptimizer:
         logger.info(f"生成了 {len(candidates)} 个有效候选代码")
         return candidates
     
-    def _generate_single_candidate(self, prompt: str) -> Optional[str]:
+    def _generate_single_candidate(self, prompt: str, iteration: int, cand_idx: int) -> Optional[str]:
         """生成单个候选代码"""
-        # 1) 构建输入（支持 chat 模板，如 Qwen 系列）
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            messages = [
-                {"role": "system", "content": "你是精通数字电路和Verilog的资深芯片工程师，目标是优化面积/触发器数/逻辑深度。"},
-                {"role": "user", "content": prompt},
-            ]
-            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
+        # 1) 构建输入（支持 chat 模板，如 Qwen 系列；若未配置模板则回退纯文本）
+        use_chat = hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None)
+        # 统一计算上下文与生成长度的安全上限
+        context_max = self._get_context_window()
+        effective_new = max(64, min(self.max_new_tokens, context_max - 256))
+        input_max = max(256, context_max - effective_new)
+        if self.debug_gen:
+            logger.debug(f"context_max={context_max}, input_max={input_max}, effective_new={effective_new}")
+        if use_chat:
+            try:
+                messages = [
+                    {"role": "system", "content": "你是精通数字电路和Verilog的资深芯片工程师，目标是优化面积/触发器数/逻辑深度。"},
+                    {"role": "user", "content": prompt},
+                ]
+                text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=input_max)
+            except Exception:
+                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=input_max)
         else:
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=input_max)
 
         input_len = inputs["input_ids"].shape[1]
 
@@ -247,7 +300,7 @@ class RLOptimizer:
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=effective_new,
                 temperature=self.temperature,
                 do_sample=True,
                 top_p=0.9,
@@ -261,9 +314,20 @@ class RLOptimizer:
         if new_tokens.numel() == 0:
             return None
         generated_tail = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        self._maybe_dump_text(iteration, cand_idx, "generated_tail.txt", generated_tail)
+        # 也保存 prompt，便于对照
+        self._maybe_dump_text(iteration, cand_idx, "prompt.txt", prompt)
 
         # 3) 提取生成的代码部分（优先代码块，其次 module..endmodule）
+        method = "raw"
+        if "```" in generated_tail:
+            method = "fenced"
+        elif ("module" in generated_tail) and ("endmodule" in generated_tail):
+            method = "module"
         code_part = self._extract_code_block(generated_tail).strip()
+        if self.debug_gen:
+            logger.debug(f"提取方法={method}, 提取后长度={len(code_part)}")
+        self._maybe_dump_text(iteration, cand_idx, f"extracted_{method}.v", code_part)
         if not code_part:
             # 兜底：若模型把“优化后的代码：”重复了，进一步切分
             if "优化后的代码：" in generated_tail:
@@ -327,6 +391,91 @@ class RLOptimizer:
             self.eda.cleanup()
 
     # === 辅助方法 ===
+    def _has_complete_module(self, text: str) -> bool:
+        return ("module" in text) and ("endmodule" in text)
+
+    def _try_fix_module_name(self, code: str, module_name: str) -> str:
+        """若候选的顶层 module 名称与期望不同，则仅替换第一个 module 声明的名称为期望名。支持可选参数块 #(...)."""
+        pattern = re.compile(r"(\bmodule\s+)([A-Za-z_][A-Za-z0-9_]*)(\s*(?:#\s*\([\s\S]*?\))?\s*\()", flags=re.IGNORECASE)
+        def _repl(m):
+            return f"{m.group(1)}{module_name}{m.group(3)}"
+        return pattern.sub(_repl, code, count=1)
+    
+    def _extract_module_ports(self, code: str, module_name: str) -> Optional[str]:
+        """提取 module 头部括号内的端口列表文本。兼容可选参数块。"""
+        pat = re.compile(rf"\bmodule\s+{re.escape(module_name)}\s*(?:#\s*\([\s\S]*?\))?\s*\(([\s\S]*?)\)\s*;", flags=re.IGNORECASE)
+        m = pat.search(code)
+        if m:
+            return m.group(1)
+        return None
+
+    def _extract_module_params(self, code: str, module_name: str) -> Optional[str]:
+        """提取 module 名后的参数块 #( ... ) 文本（包含括号），若无返回 None。"""
+        pat = re.compile(rf"\bmodule\s+{re.escape(module_name)}\s*(#\s*\([\s\S]*?\))\s*\(", flags=re.IGNORECASE)
+        m = pat.search(code)
+        if m:
+            return m.group(1)
+        return None
+
+    def _align_module_header(self, base_code: str, cand_code: str, module_name: str) -> str:
+        """将候选的顶层 module 头部的参数块与端口列表替换为基准代码对应部分，以最大化接口一致性。"""
+        base_ports = self._extract_module_ports(base_code, module_name)
+        base_params = self._extract_module_params(base_code, module_name)
+        if not base_ports:
+            return cand_code
+        # 组装替换：module name [params] (ports);
+        def _repl(m):
+            pre = m.group(1)  # 'module name'
+            # 若基准有参数块则使用之，否则保持候选的（m.group(2)包含候选的可选参数块）
+            cand_params = m.group(2) or ""
+            params_use = base_params if base_params is not None else cand_params
+            return f"{pre}{params_use}({base_ports})" + m.group(4)
+        pat = re.compile(rf"(\bmodule\s+{re.escape(module_name)}\s*)(#\s*\([\s\S]*?\))?\s*\([\s\S]*?\)(\s*;)", flags=re.IGNORECASE)
+        # 由于分组调整，修正规则为：pre (group1), params? (group2), we need suffix ; (group3)
+        # 使用更明确的替换重写：
+        def _repl2(m):
+            pre = m.group(1)
+            params_use = base_params if base_params is not None else (m.group(2) or "")
+            suffix = m.group(3)
+            return f"{pre}{params_use}({base_ports}){suffix}"
+        return pat.sub(_repl2, cand_code, count=1)
+
+    def _get_context_window(self) -> int:
+        """安全获取模型上下文窗口大小，避免部分 tokenizer 报告的超大数值导致底层转换溢出。
+        策略：
+        - 若 tokenizer.model_max_length 缺失，默认 4096；
+        - 若其值极大(>=1e6)或等于奇异占位(如 100000000000000001988462...), 则回退 4096；
+        - 全局上限 8192，避免GPU内存与底层整型溢出。
+        """
+        try:
+            m = int(getattr(self.tokenizer, "model_max_length", 4096) or 4096)
+        except Exception:
+            m = 4096
+        # 过滤异常大值
+        if m >= 1_000_000:
+            m = 4096
+        # 设定全局上限
+        m = max(1024, min(m, 8192))
+        return m
+
+    # === 调试输出 ===
+    def _candidate_dir(self, iteration: int, cand_idx: int) -> Optional[str]:
+        if not self.debug_gen or not self.debug_dir:
+            return None
+        d = Path(self.debug_dir) / f"iter_{iteration:02d}" / f"cand_{cand_idx:02d}"
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
+
+    def _maybe_dump_text(self, iteration: int, cand_idx: int, name: str, content: str):
+        try:
+            d = self._candidate_dir(iteration, cand_idx)
+            if not d:
+                return
+            p = Path(d) / name
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(content or "")
+        except Exception:
+            pass
     def _detect_top_module(self, code: str) -> Optional[str]:
         """从 Verilog 源码中自动检测顶层模块名。
         策略：
