@@ -37,10 +37,15 @@ def main():
     parser.add_argument('--input', '-i', required=True, help='输入Verilog文件')
     parser.add_argument('--target', '-t', default='', help='优化目标（可选）')
     parser.add_argument('--iterations', type=int, default=10, help='最大迭代次数')
-    parser.add_argument('--population', type=int, default=5, help='候选代码数量')
+    parser.add_argument('--population', type=int, default=1, help='候选代码数量（RL模式建议为1）')
     parser.add_argument('--temperature', type=float, default=0.8, help='生成温度')
+    parser.add_argument('--top-p', type=float, default=0.9, help='nucleus sampling参数')
+    parser.add_argument('--top-k', type=int, default=50, help='top-k sampling参数')
+    parser.add_argument('--repetition-penalty', type=float, default=1.05, help='重复惩罚系数')
     parser.add_argument('--max-new-tokens', type=int, default=1024, help='每次生成的最大新tokens数')
     parser.add_argument('--debug-gen', action='store_true', help='开启生成与等价检查的调试输出（会将prompt/生成文本/提取代码/等价脚本与日志写入outputs目录）')
+    parser.add_argument('--rl-mode', action='store_true', default=True, help='启用RL动态调整模式（默认开启）')
+    parser.add_argument('--no-rl', dest='rl_mode', action='store_false', help='禁用RL模式，使用传统多候选搜索')
     parser.add_argument('--debug-dir', type=str, help='自定义调试输出目录（默认 outputs/debug_时间戳）')
     parser.add_argument('--output', '-o', help='输出目录（保存优化代码与报告）')
 
@@ -65,6 +70,10 @@ def main():
         max_new_tokens=args.max_new_tokens,
         debug_gen=args.debug_gen,
         debug_dir=args.debug_dir,
+        rl_mode=args.rl_mode,
+        base_top_p=getattr(args, 'top_p', 0.9),
+        base_top_k=getattr(args, 'top_k', 50),
+        base_rep_penalty=getattr(args, 'repetition_penalty', 1.05),
     )
     try:
         result = optimizer.optimize(code, args.target)
