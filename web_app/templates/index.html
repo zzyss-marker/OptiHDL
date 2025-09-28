@@ -18,7 +18,6 @@
         <div class="control-row">
             <button id="btn-analyze" class="primary">EDA分析</button>
             <button id="btn-optimize" class="accent">开始优化</button>
-            <input id="target-text" type="text" placeholder="优化目标（可选，例如：减少面积提高时序）">
         </div>
         <div class="status" id="global-status"></div>
     </section>
@@ -27,13 +26,18 @@
         <div class="column">
             <h3>EDA 分析结果</h3>
             <pre id="eda-output" class="result-block">等待分析...</pre>
+            
+            <h3>系统日志</h3>
+            <div id="log-container" class="log-container">
+                <div class="log-entry info">系统已启动，等待操作...</div>
+            </div>
         </div>
         <div class="column">
             <h3>优化结果对比</h3>
             <div class="split">
                 <div>
-                    <h4>原始代码</h4>
-                    <pre id="original-code" class="code-block">尚无数据</pre>
+                    <h4>原始代码 <button id="toggle-original" class="toggle-btn">展开/折叠</button></h4>
+                    <pre id="original-code" class="code-block collapsible">尚无数据</pre>
                 </div>
                 <div>
                     <h4>优化后代码</h4>
