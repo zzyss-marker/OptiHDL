@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  optihdl-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: optihdl-web
+    ports:
+      - "5000:5000"
+    volumes:
+      # 挂载模型目录（避免每次重新下载大模型文件）
+      - ./models/qwen:/app/models/qwen
+      - ./models/qwen_finetuned:/app/models/qwen_finetuned
+      - ./models/qwen_finetuned_merged:/app/models/qwen_finetuned_merged
+      # 挂载数据目录
+      - ./data:/app/data
+      # 挂载日志目录
+      - ./logs:/app/logs
+      # 挂载上传文件目录
+      - ./uploads:/app/uploads
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FLASK_ENV=production
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

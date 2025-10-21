@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# 日志和临时文件
+logs/
+*.log
+temp/
+tmp/
+uploads/
+*.tmp
+
+# 模型文件（太大，通过挂载卷）
+# 排除模型目录下的所有文件，但保留目录结构
+models/qwen/*
+models/qwen_finetuned/*
+!models/.gitkeep
+!models/qwen/.gitkeep
+!models/qwen_finetuned/.gitkeep
+
+# 数据文件
+data/*.json
+!data/.gitkeep
+
+# 测试
+tests/
+pytest_cache/
+.coverage
+htmlcov/
+
+# 文档
+docs/
+*.md
+!README.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 其他
+.DS_Store
+Thumbs.db
