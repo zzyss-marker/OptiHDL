@@ -7,40 +7,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
+from loguru import logger as log
 
 from core_tools.eda_wrapper import analyze_verilog_api
 from optimization.rl_optimizer import RLOptimizer
 
 
-class OptimizerThread(threading.Thread):
-    def __init__(self, code: str, target: str, manager: "OptimizationManager"):
-        super().__init__(daemon=True)
-        self.code = code
-        self.target = target
-        self.manager = manager
-
-    def run(self):
-        try:
-            result = self.manager.run_optimizer(self.code, self.target)
-            self.manager.update_result(result)
-        except Exception as exc:  # noqa: BLE001
-            self.manager.update_result({
-                "success": False,
-                "error": str(exc),
-            })
-
-
 class OptimizationManager:
-    """负责协调EDA分析与RL优化，维护状态。"""
+    """负责协调EDA分析与RL优化"""
 
     def __init__(self):
-        self._lock = threading.Lock()
         self._optimizer = None
-        self._latest_result = None
-        self._running = False
 
     def ensure_optimizer(self, model_path: str):
         if self._optimizer is None:
+            log.info(f"[Manager] 初始化优化器: {model_path}")
             self._optimizer = RLOptimizer(
                 model_path=model_path,
                 max_iterations=5,
@@ -52,33 +34,22 @@ class OptimizationManager:
             )
         return self._optimizer
 
-    def start_optimization(self, code: str, target: str, model_path: str):
-        with self._lock:
-            if self._running:
-                raise RuntimeError("已有优化任务在运行，请稍候")
-            self._running = True
-            self._latest_result = None
-
-        optimizer = self.ensure_optimizer(model_path)
-
-        thread = OptimizerThread(code, target, self)
-        thread.start()
-        return thread
-
-    def run_optimizer(self, code: str, target: str):
-        optimizer = self.ensure_optimizer(get_default_model_path())
-        return optimizer.optimize(code, target)
-
-    def update_result(self, result: dict):
-        with self._lock:
-            self._latest_result = result
-            self._running = False
-
-    def get_status(self):
-        with self._lock:
+    def optimize(self, code: str, target: str, model_path: str):
+        """直接执行优化并返回结果（同步）"""
+        log.info(f"[Manager] 开始优化任务")
+        
+        try:
+            optimizer = self.ensure_optimizer(model_path)
+            result = optimizer.optimize(code, target)
+            log.info(f"[Manager] 优化完成，success={result.get('success')}")
+            return result
+        except Exception as exc:
+            log.error(f"[Manager] 优化异常: {exc}")
+            import traceback
+            log.error(traceback.format_exc())
             return {
-                "running": self._running,
-                "result": self._latest_result,
+                "success": False,
+                "error": str(exc),
             }
 
     def cleanup(self):
@@ -99,6 +70,12 @@ def get_default_model_path() -> str:
 def create_app():
     app = Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
+    
+    # 启用 CORS（解决 Docker 环境跨域问题）
+    CORS(app)
+    
+    # 配置日志
+    log.add("logs/web_app.log", rotation="10 MB", retention="7 days")
 
     manager = OptimizationManager()
 
@@ -119,30 +96,19 @@ def create_app():
 
     @app.route("/api/optimize", methods=["POST"])
     def api_optimize():
+        """直接执行优化并返回结果（同步）"""
         payload = request.get_json(force=True)
         code = payload.get("code", "")
         target = payload.get("target", "")
+        
         if not code.strip():
             return jsonify({"success": False, "error": "请输入待优化的Verilog代码"}), 400
 
-        try:
-            manager.start_optimization(code, target, get_default_model_path())
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"success": False, "error": str(exc)}), 400
-
-        return jsonify({"success": True})
-
-    @app.route("/api/optimize/status", methods=["GET"])
-    def api_optimize_status():
-        status = manager.get_status()
-        return jsonify(status)
-
-    @app.route("/api/optimize/result", methods=["GET"])
-    def api_optimize_result():
-        status = manager.get_status()
-        if status["result"] is None:
-            return jsonify({"success": False, "error": "暂无结果"}), 404
-        return jsonify(status["result"])
+        log.info("[API] 收到优化请求，开始执行...")
+        result = manager.optimize(code, target, get_default_model_path())
+        log.info(f"[API] 优化完成，返回结果: success={result.get('success')}")
+        
+        return jsonify(result)
 
     @app.teardown_appcontext
     def shutdown_session(exception=None):  # noqa: ANN001

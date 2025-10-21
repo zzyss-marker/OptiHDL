@@ -9,8 +9,6 @@ const metricsTable = document.getElementById("metrics-table").querySelector("tbo
 const logContainer = document.getElementById("log-container");
 const toggleOriginalBtn = document.getElementById("toggle-original");
 
-let pollTimer = null;
-
 function setStatus(message, type = "info") {
     statusBox.textContent = message;
     statusBox.dataset.type = type;
@@ -147,42 +145,6 @@ function updateOptimizationResult(result) {
     addLogEntry("代码优化成功完成", "success");
 }
 
-async function pollOptimizationStatus() {
-    try {
-        const statusResp = await fetch("/api/optimize/status");
-        const statusData = await statusResp.json();
-        if (statusData.running) {
-            setStatus("正在优化，请稍候...", "info");
-            return;
-        }
-        const resultResp = await fetch("/api/optimize/result");
-        if (resultResp.status === 404) {
-            setStatus("暂无结果，请稍后重试", "warn");
-            stopPolling();
-            return;
-        }
-        const result = await resultResp.json();
-        updateOptimizationResult(result);
-        stopPolling();
-    } catch (err) {
-        console.error(err);
-        setStatus(`轮询失败: ${err.message}`, "error");
-        stopPolling();
-    }
-}
-
-function startPolling() {
-    stopPolling();
-    pollTimer = setInterval(pollOptimizationStatus, 3000);
-}
-
-function stopPolling() {
-    if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-    }
-}
-
 async function optimizeCode() {
     const code = inputArea.value;
     if (!code.trim()) {
@@ -190,26 +152,26 @@ async function optimizeCode() {
         addLogEntry("优化失败：代码为空", "warning");
         return;
     }
-    setStatus("提交优化任务...");
-    addLogEntry("开始提交优化任务", "info");
+    
+    setStatus("正在优化，请稍候...", "info");
+    addLogEntry("开始优化任务（这可能需要几分钟）", "info");
     btnOptimize.disabled = true;
 
     try {
+        // 直接调用优化接口，等待结果返回
         const response = await fetch("/api/optimize", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ code, target: "" }),
         });
+        
         const result = await response.json();
-        if (!response.ok || !result.success) {
-            setStatus(result.error || "优化启动失败", "error");
-            addLogEntry(`优化启动失败: ${result.error || "未知错误"}`, "error");
-            btnOptimize.disabled = false;
-            return;
-        }
-        setStatus("优化任务已启动，正在等待结果...", "info");
-        addLogEntry("优化任务已提交，开始轮询结果", "info");
-        startPolling();
+        console.log("[优化] 收到结果:", result);
+        
+        // 直接更新结果
+        updateOptimizationResult(result);
+        btnOptimize.disabled = false;
+        
     } catch (err) {
         console.error(err);
         setStatus(`请求失败: ${err.message}`, "error");
@@ -221,5 +183,3 @@ async function optimizeCode() {
 btnAnalyze.addEventListener("click", analyzeCode);
 btnOptimize.addEventListener("click", optimizeCode);
 toggleOriginalBtn.addEventListener("click", toggleCodeCollapse);
-
-window.addEventListener("beforeunload", () => stopPolling());
