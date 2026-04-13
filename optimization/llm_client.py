@@ -169,13 +169,14 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
         }
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
 
         response = requests.post(
             f"{self.base_url}/chat/completions",
             headers=headers,
-            json=payload,
+            data=body,
             timeout=self.timeout,
         )
         response.raise_for_status()

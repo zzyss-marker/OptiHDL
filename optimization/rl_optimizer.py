@@ -448,9 +448,10 @@ class RLOptimizer:
         best_metrics: Dict[str, Any],
         latest_iteration_score: float,
     ) -> Dict[str, Any]:
+        target_text = target_description or self.target_profile.get("name", "balanced")
         payload = {
             "iteration": iteration,
-            "target": target_description or self.target_profile.get("label", "balanced"),
+            "target": target_text,
             "initial_metrics": initial_metrics,
             "best_metrics": best_metrics,
             "current_best_score": round(current_best_score, 6),
@@ -461,16 +462,21 @@ class RLOptimizer:
         }
 
         prompt = (
-            "你是优化控制智能体。请根据如下 EDA 结果判断是否继续优化。\n"
-            "只输出 JSON，格式为 {\"action\":\"continue|stop\",\"reason\":\"...\",\"focus\":\"...\"}。\n\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            "You are the optimization control agent.\n"
+            "Decide whether the optimization loop should continue based on the EDA metrics below.\n"
+            "Return JSON only in this format:\n"
+            "{\"action\":\"continue|stop\",\"reason\":\"...\",\"focus\":\"...\"}\n\n"
+            f"{json.dumps(payload, ensure_ascii=True, indent=2)}"
         )
 
         fallback = self._heuristic_agent_decision(payload)
         try:
             raw_text = self.llm_client.generate(
                 prompt,
-                system_prompt="你负责决定 Verilog 优化流程是否继续执行，必须基于客观 EDA 指标作出判断。",
+                system_prompt=(
+                    "You decide whether a Verilog optimization loop should continue. "
+                    "Your decision must be based on objective EDA metrics only."
+                ),
                 temperature=0.2,
                 max_new_tokens=160,
                 top_p=0.9,
