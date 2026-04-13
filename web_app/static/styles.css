@@ -60,6 +60,17 @@ textarea#verilog-input {
     resize: vertical;
 }
 
+input[type="text"],
+input[type="password"],
+select {
+    padding: 12px 14px;
+    background: rgba(9, 13, 24, 0.92);
+    color: #e2e8f0;
+    border: 1px solid rgba(88, 104, 140, 0.45);
+    border-radius: 12px;
+    font-size: 14px;
+}
+
 .control-row {
     display: flex;
     align-items: center;

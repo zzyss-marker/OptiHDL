@@ -3,21 +3,50 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>OptiHDL Web 控制台</title>
+    <title>OptiHDL Agent Console</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
 <header>
-    <h1>OptiHDL Verilog 优化与EDA可视化</h1>
-    <p>上传或粘贴Verilog代码，先运行EDA分析，再触发强化学习优化，实时对比指标。</p>
+    <h1>OptiHDL Agent</h1>
+    <p>LLM generates Verilog candidates, EDA tools return objective metrics, and the agent decides whether to continue optimization.</p>
 </header>
 <main>
     <section class="panel">
-        <h2>输入代码</h2>
-        <textarea id="verilog-input" placeholder="在此粘贴Verilog模块代码"></textarea>
+        <h2>Model Settings</h2>
         <div class="control-row">
-            <button id="btn-analyze" class="primary">EDA分析</button>
-            <button id="btn-optimize" class="accent">开始优化</button>
+            <select id="llm-mode-input" style="min-width:180px;">
+                <option value="auto">auto</option>
+                <option value="api">api</option>
+                <option value="local">local</option>
+            </select>
+            <input id="local-model-input" type="text" placeholder="本地模型路径，可选" style="flex:1; min-width:260px;">
+        </div>
+        <div class="control-row">
+            <input id="api-base-url-input" type="text" placeholder="API Base URL，例如 http://127.0.0.1:8000/v1" style="flex:1; min-width:260px;">
+            <input id="api-model-input" type="text" placeholder="API Model，例如 qwen2.5-coder" style="flex:1; min-width:220px;">
+        </div>
+        <div class="control-row">
+            <input id="api-key-input" type="password" placeholder="API Key" style="flex:1; min-width:260px;">
+            <button id="btn-save-settings" class="primary">保存配置</button>
+        </div>
+        <pre class="result-block" id="settings-help">ENV fallback:
+OPTIHDL_LLM_MODE=api|local|auto
+OPTIHDL_API_BASE_URL=...
+OPTIHDL_API_KEY=...
+OPTIHDL_API_MODEL=...</pre>
+    </section>
+
+    <section class="panel">
+        <h2>Input</h2>
+        <div class="control-row">
+            <input id="target-input" type="text" placeholder="优化目标，例如：面积优先 / 时序优先" style="flex:1; min-width:240px;">
+            <input id="scenario-input" type="text" placeholder="应用场景，例如：智能制造 / 芯片设计辅助" style="flex:1; min-width:240px;">
+        </div>
+        <textarea id="verilog-input" placeholder="在这里粘贴 Verilog 模块代码"></textarea>
+        <div class="control-row">
+            <button id="btn-analyze" class="primary">EDA 分析</button>
+            <button id="btn-optimize" class="accent">开始 Agent 优化</button>
         </div>
         <div class="status" id="global-status"></div>
     </section>
@@ -26,7 +55,7 @@
         <div class="column">
             <h3>EDA 分析结果</h3>
             <pre id="eda-output" class="result-block">等待分析...</pre>
-            
+
             <h3>系统日志</h3>
             <div id="log-container" class="log-container">
                 <div class="log-entry info">系统已启动，等待操作...</div>
@@ -37,13 +66,14 @@
             <div class="split">
                 <div>
                     <h4>原始代码 <button id="toggle-original" class="toggle-btn">展开/折叠</button></h4>
-                    <pre id="original-code" class="code-block collapsible">尚无数据</pre>
+                    <pre id="original-code" class="code-block collapsible">暂无数据</pre>
                 </div>
                 <div>
                     <h4>优化后代码</h4>
-                    <pre id="optimized-code" class="code-block">尚无数据</pre>
+                    <pre id="optimized-code" class="code-block">暂无数据</pre>
                 </div>
             </div>
+
             <h4>指标对比</h4>
             <table id="metrics-table">
                 <thead>
@@ -55,14 +85,17 @@
                     </tr>
                 </thead>
                 <tbody>
-                    <tr><td colspan="4">尚无数据</td></tr>
+                    <tr><td colspan="4">暂无数据</td></tr>
                 </tbody>
             </table>
+
+            <h4>Agent 决策</h4>
+            <pre id="agent-output" class="result-block">等待优化...</pre>
         </div>
     </section>
 </main>
 <footer>
-    <p>OptiHDL © {{ current_year }}</p>
+    <p>OptiHDL Agent</p>
 </footer>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

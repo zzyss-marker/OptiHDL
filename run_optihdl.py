@@ -1,67 +1,61 @@
 #!/usr/bin/env python3
-"""
-模块4: OptiHDL 启动脚本
-单一模式：自动选择 models/ 下的模型或用 --model 指定，
-输入一个 Verilog 文件，先做 EDA 评分，然后进入 RL 循环优化，输出结果。
-"""
 
+import argparse
+import json
 import os
 import sys
-import argparse
+import time
 from pathlib import Path
 
-# 添加项目根目录到Python路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 
 def auto_find_model(models_dir: Path) -> str:
-    """在 models/ 下自动选择一个可用模型目录（优先含 adapter_config.json，其次 config.json）。"""
+    if os.environ.get("OPTIHDL_LLM_MODE", "").strip().lower() == "api":
+        return "api-client"
     if not models_dir.exists():
-        raise FileNotFoundError(f"未找到模型目录: {models_dir}")
+        raise FileNotFoundError(f"Model directory not found: {models_dir}")
+
     candidates = []
-    for p in models_dir.iterdir():
-        if p.is_dir():
-            if (p / 'adapter_config.json').exists() or (p / 'config.json').exists():
-                candidates.append(p)
+    for path in models_dir.iterdir():
+        if path.is_dir() and ((path / "adapter_config.json").exists() or (path / "config.json").exists()):
+            candidates.append(path)
     if not candidates:
-        raise FileNotFoundError(f"models/ 下未找到可用模型（缺少 adapter_config.json 或 config.json）")
-    # 选择修改时间最新的
-    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        raise FileNotFoundError("No available model found under models/")
+
+    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     return str(candidates[0])
 
 
-def main():
-    parser = argparse.ArgumentParser(description="OptiHDL - 一键优化：models下自动选模型 + 输入Verilog文件")
-    parser.add_argument('--model', help='模型或适配器目录（缺省时自动从 models/ 下选择）')
-    parser.add_argument('--input', '-i', required=True, help='输入Verilog文件')
-    parser.add_argument('--target', '-t', default='', help='优化目标（可选）')
-    parser.add_argument('--iterations', type=int, default=10, help='最大迭代次数')
-    parser.add_argument('--population', type=int, default=1, help='候选代码数量（RL模式建议为1）')
-    parser.add_argument('--temperature', type=float, default=0.8, help='生成温度')
-    parser.add_argument('--top-p', type=float, default=0.9, help='nucleus sampling参数')
-    parser.add_argument('--top-k', type=int, default=50, help='top-k sampling参数')
-    parser.add_argument('--repetition-penalty', type=float, default=1.05, help='重复惩罚系数')
-    parser.add_argument('--max-new-tokens', type=int, default=1024, help='每次生成的最大新tokens数')
-    parser.add_argument('--debug-gen', action='store_true', help='开启生成与等价检查的调试输出（会将prompt/生成文本/提取代码/等价脚本与日志写入outputs目录）')
-    parser.add_argument('--rl-mode', action='store_true', default=True, help='启用RL动态调整模式（默认开启）')
-    parser.add_argument('--no-rl', dest='rl_mode', action='store_false', help='禁用RL模式，使用传统多候选搜索')
-    parser.add_argument('--debug-dir', type=str, help='自定义调试输出目录（默认 outputs/debug_时间戳）')
-    parser.add_argument('--output', '-o', help='输出目录（保存优化代码与报告）')
-
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OptiHDL agent optimizer")
+    parser.add_argument("--model", help="Model or adapter path. Optional in API mode.")
+    parser.add_argument("--input", "-i", required=True, help="Input Verilog file")
+    parser.add_argument("--target", "-t", default="", help="Optimization target description")
+    parser.add_argument("--scenario", default="", help="Application scenario description")
+    parser.add_argument("--iterations", type=int, default=10, help="Maximum iterations")
+    parser.add_argument("--population", type=int, default=1, help="Candidates per iteration")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Generation temperature")
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
+    parser.add_argument("--repetition-penalty", type=float, default=1.05, help="Repetition penalty")
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum generated tokens")
+    parser.add_argument("--debug-gen", action="store_true", help="Enable generation debug output")
+    parser.add_argument("--rl-mode", action="store_true", default=True, help="Enable dynamic strategy")
+    parser.add_argument("--no-rl", dest="rl_mode", action="store_false", help="Disable dynamic strategy")
+    parser.add_argument("--debug-dir", type=str, help="Custom debug output directory")
+    parser.add_argument("--output", "-o", help="Output directory")
     args = parser.parse_args()
 
-    # 确定模型路径
-    model_path = args.model or auto_find_model(project_root / 'models')
-
-    # 读取输入代码
+    model_path = args.model or auto_find_model(project_root / "models")
     input_path = Path(args.input)
     if not input_path.exists():
-        raise FileNotFoundError(f"输入Verilog文件不存在: {input_path}")
-    code = input_path.read_text(encoding='utf-8', errors='ignore')
+        raise FileNotFoundError(f"Input Verilog file not found: {input_path}")
+    code = input_path.read_text(encoding="utf-8", errors="ignore")
 
-    # 运行优化
     from optimization.rl_optimizer import RLOptimizer
+
     optimizer = RLOptimizer(
         model_path=model_path,
         max_iterations=args.iterations,
@@ -71,46 +65,51 @@ def main():
         debug_gen=args.debug_gen,
         debug_dir=args.debug_dir,
         rl_mode=args.rl_mode,
-        base_top_p=getattr(args, 'top_p', 0.9),
-        base_top_k=getattr(args, 'top_k', 50),
-        base_rep_penalty=getattr(args, 'repetition_penalty', 1.05),
+        base_top_p=getattr(args, "top_p", 0.9),
+        base_top_k=getattr(args, "top_k", 50),
+        base_rep_penalty=getattr(args, "repetition_penalty", 1.05),
     )
+
     try:
-        result = optimizer.optimize(code, args.target)
+        result = optimizer.optimize(code, args.target, args.scenario)
     finally:
         optimizer.cleanup()
 
-    # 输出结果
-    if result.get('success'):
-        print("=== 优化完成 ===")
-        print(f"模型: {model_path}")
-        print(f"面积改进: {result['improvement']['area_improvement']:.2f}%")
-        print(f"触发器数改进: {result['improvement']['ff_improvement']:.2f}%")
-        print(f"逻辑深度改进: {result['improvement']['depth_improvement']:.2f}%")
-        print(f"总分改进: {result['improvement']['score_improvement']:.2f}%")
+    if not result.get("success"):
+        print(f"Optimization failed: {result.get('error')}")
+        return
 
-        # 打印最后一次对比
-        orig = result['original_metrics']
-        opt = result['optimized_metrics']
-        print("--- 指标对比 ---")
-        print(f"面积: {orig['area']} -> {opt['area']}")
-        print(f"触发器数: {orig.get('num_ff', 0)} -> {opt.get('num_ff', 0)}")
-        print(f"逻辑深度: {orig.get('logic_depth', 0)} -> {opt.get('logic_depth', 0)}")
+    print("=== Optimization Finished ===")
+    print(f"Model: {model_path}")
+    print(f"LLM mode: {result.get('llm_mode')}")
+    print(f"Area improvement: {result['improvement']['area_improvement']:.2f}%")
+    print(f"FF improvement: {result['improvement']['ff_improvement']:.2f}%")
+    print(f"Depth improvement: {result['improvement']['depth_improvement']:.2f}%")
+    print(f"Score improvement: {result['improvement']['score_improvement']:.2f}%")
 
-        # 保存输出（即使未指定 --output，也默认保存到 outputs/opt_YYYYmmdd_HHMMSS）
-        import time as _time
-        import json as _json
-        if args.output:
-            out_dir = Path(args.output)
-        else:
-            ts = _time.strftime("%Y%m%d_%H%M%S")
-            out_dir = Path("outputs") / f"opt_{ts}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / 'optimized_code.v').write_text(result['optimized_code'], encoding='utf-8')
-        (out_dir / 'optimization_report.json').write_text(_json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
-        print(f"结果已保存到: {out_dir}")
+    orig = result["original_metrics"]
+    opt = result["optimized_metrics"]
+    print("--- Metrics ---")
+    print(f"Area: {orig['area']} -> {opt['area']}")
+    print(f"FF: {orig.get('num_ff', 0)} -> {opt.get('num_ff', 0)}")
+    print(f"Depth: {orig.get('logic_depth', 0)} -> {opt.get('logic_depth', 0)}")
+
+    if args.output:
+        out_dir = Path(args.output)
     else:
-        print(f"优化失败: {result.get('error')}")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out_dir = Path("outputs") / f"opt_{ts}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / "optimized_code.v").write_text(result["optimized_code"], encoding="utf-8")
+    (out_dir / "optimization_report.json").write_text(
+        json.dumps(result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    competition_summary = result.get("competition_package", {}).get("markdown_report")
+    if competition_summary:
+        (out_dir / "competition_summary.md").write_text(competition_summary, encoding="utf-8")
+    print(f"Saved to: {out_dir}")
 
 
 if __name__ == "__main__":
