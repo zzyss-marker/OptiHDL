@@ -1,6 +1,9 @@
 from pathlib import Path
 import os
 import sys
+import threading
+import time
+import uuid
 
 from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
@@ -134,6 +137,42 @@ def create_app() -> Flask:
     manager = OptimizationManager()
     runtime_settings = load_runtime_settings()
     apply_runtime_settings(runtime_settings)
+    jobs: dict[str, dict] = {}
+
+    def start_job(job_type: str, target_fn, *args):
+        job_id = uuid.uuid4().hex
+        jobs[job_id] = {
+            "id": job_id,
+            "type": job_type,
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": None,
+        }
+
+        def runner():
+            jobs[job_id]["status"] = "running"
+            jobs[job_id]["updated_at"] = time.time()
+            try:
+                result = target_fn(*args)
+                jobs[job_id]["result"] = result
+                jobs[job_id]["status"] = "completed"
+            except Exception as exc:
+                log.exception(f"[Job] {job_type} failed")
+                jobs[job_id]["error"] = str(exc)
+                jobs[job_id]["status"] = "failed"
+            finally:
+                jobs[job_id]["updated_at"] = time.time()
+
+        threading.Thread(target=runner, daemon=True).start()
+        return job_id
+
+    def job_response(job_id: str):
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"success": False, "error": "Job not found"}), 404
+        return jsonify({"success": True, "job": job})
 
     @app.route("/")
     def index():
@@ -163,6 +202,16 @@ def create_app() -> Flask:
             return jsonify({"success": False, "error": "Please input Verilog code"}), 400
         return jsonify(analyze_verilog_api(code, module_name))
 
+    @app.route("/api/analyze_async", methods=["POST"])
+    def api_analyze_async():
+        payload = request.get_json(force=True)
+        code = payload.get("code", "")
+        module_name = payload.get("module", "top")
+        if not code.strip():
+            return jsonify({"success": False, "error": "Please input Verilog code"}), 400
+        job_id = start_job("analyze", analyze_verilog_api, code, module_name)
+        return jsonify({"success": True, "job_id": job_id})
+
     @app.route("/api/optimize", methods=["POST"])
     def api_optimize():
         payload = request.get_json(force=True)
@@ -181,6 +230,39 @@ def create_app() -> Flask:
             runtime_settings,
         )
         return jsonify(result)
+
+    @app.route("/api/optimize_async", methods=["POST"])
+    def api_optimize_async():
+        payload = request.get_json(force=True)
+        code = payload.get("code", "")
+        target = payload.get("target", "")
+        scenario = payload.get("scenario", "")
+
+        if not code.strip():
+            return jsonify({"success": False, "error": "Please input Verilog code to optimize"}), 400
+
+        model_path = get_default_model_path(runtime_settings)
+        job_id = start_job(
+            "optimize",
+            manager.optimize,
+            code,
+            target,
+            scenario,
+            model_path,
+            runtime_settings,
+        )
+        return jsonify({"success": True, "job_id": job_id})
+
+    @app.route("/api/jobs/<job_id>", methods=["GET"])
+    def api_job_status(job_id: str):
+        return job_response(job_id)
+
+    @app.errorhandler(Exception)
+    def handle_api_exception(exc):  # noqa: ANN001
+        if request.path.startswith("/api/"):
+            log.exception("[API] unhandled exception")
+            return jsonify({"success": False, "error": str(exc)}), 500
+        raise exc
 
     @app.teardown_appcontext
     def shutdown_session(exception=None):  # noqa: ANN001

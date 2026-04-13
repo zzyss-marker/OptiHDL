@@ -157,6 +157,37 @@ function renderAgentDecisions(result) {
     }).join("\n\n");
 }
 
+async function parseApiResponse(response) {
+    const contentType = response.headers.get("content-type") || "";
+    const rawText = await response.text();
+    if (contentType.includes("application/json")) {
+        return JSON.parse(rawText);
+    }
+
+    const normalized = rawText.replace(/\s+/g, " ").trim().slice(0, 240);
+    throw new Error(`HTTP ${response.status}: non-JSON response: ${normalized}`);
+}
+
+async function waitForJob(jobId, { onProgress } = {}) {
+    const maxAttempts = 600;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const response = await fetch(`/api/jobs/${jobId}`);
+        const payload = await parseApiResponse(response);
+        const job = payload.job || {};
+        if (onProgress) {
+            onProgress(job);
+        }
+        if (job.status === "completed") {
+            return job.result;
+        }
+        if (job.status === "failed") {
+            throw new Error(job.error || "Job failed");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error("Job polling timed out");
+}
+
 async function analyzeCode() {
     const code = inputArea.value;
     if (!code.trim()) {
@@ -171,12 +202,17 @@ async function analyzeCode() {
     btnAnalyze.disabled = true;
 
     try {
-        const response = await fetch("/api/analyze", {
+        const response = await fetch("/api/analyze_async", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ code, module: detectedModule }),
         });
-        const result = await response.json();
+        const startPayload = await parseApiResponse(response);
+        const result = await waitForJob(startPayload.job_id, {
+            onProgress(job) {
+                setStatus(`EDA 分析中... ${job.status}`, "info");
+            },
+        });
         edaOutput.textContent = formatEDAResult(result);
         if (result.success) {
             originalCode.textContent = code;
@@ -229,12 +265,17 @@ async function optimizeCode() {
     btnOptimize.disabled = true;
 
     try {
-        const response = await fetch("/api/optimize", {
+        const response = await fetch("/api/optimize_async", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ code, target, scenario }),
         });
-        const result = await response.json();
+        const startPayload = await parseApiResponse(response);
+        const result = await waitForJob(startPayload.job_id, {
+            onProgress(job) {
+                setStatus(`Agent 正在优化... ${job.status}`, "info");
+            },
+        });
         updateOptimizationResult(result);
     } catch (err) {
         setStatus(`请求失败: ${err.message}`, "error");
