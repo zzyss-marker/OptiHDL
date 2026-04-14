@@ -43,8 +43,43 @@ function toggleCodeCollapse() {
 }
 
 function extractModuleName(code) {
-    const match = code.match(/module\s+(\w+)/);
-    return match ? match[1] : "top";
+    // Find all module declarations
+    const modulePattern = /\bmodule\s+(\w+)/g;
+    const modules = [];
+    let m;
+    while ((m = modulePattern.exec(code)) !== null) {
+        modules.push(m[1]);
+    }
+    if (modules.length === 0) return "top";
+    if (modules.length === 1) return modules[0];
+
+    // For multi-module designs, find the top-level:
+    // the module that is NOT instantiated by any other module
+    const instantiated = new Set();
+    for (const name of modules) {
+        // Match instantiation patterns: module_name instance_name ( or module_name #(
+        const instPattern = new RegExp("\\b" + name + "\\s+(?:#\\s*\\([^)]*\\)\\s*)?\\w+\\s*\\(", "g");
+        // Check if this module name appears as an instantiation (not as a declaration)
+        const declPattern = new RegExp("\\bmodule\\s+" + name + "\\b");
+        const lines = code.split("\n");
+        for (const line of lines) {
+            const trimmed = line.replace(/\/\/.*$/, "").trim();
+            if (declPattern.test(trimmed)) continue; // skip declaration line
+            if (instPattern.test(trimmed)) {
+                instantiated.add(name);
+                break;
+            }
+            instPattern.lastIndex = 0;
+        }
+    }
+
+    // Top module = declared but never instantiated
+    const topCandidates = modules.filter(n => !instantiated.has(n));
+    if (topCandidates.length > 0) return topCandidates[topCandidates.length - 1];
+
+    // Fallback: prefer name containing "top", otherwise last module
+    const topNamed = modules.find(n => n.toLowerCase().includes("top"));
+    return topNamed || modules[modules.length - 1];
 }
 
 function applySettingsToForm(settings = {}) {
@@ -559,10 +594,6 @@ function renderCircuit(containerId, circuitJson) {
     try {
         const circuit = new digitaljs.Circuit(circuitJson);
         const paper = circuit.displayOn($(container));
-        // Constrain the paper size so it doesn't blow up the page
-        if (paper && paper.setDimensions) {
-            paper.setDimensions(container.clientWidth - 20, 380);
-        }
         circuit.start();
         return circuit;
     } catch (e) {

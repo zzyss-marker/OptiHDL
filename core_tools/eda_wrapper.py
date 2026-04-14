@@ -162,25 +162,41 @@ write_verilog {mapped_netlist}
         return max(gate_count, 10)
     
     def _parse_yosys_ff_count(self, output: str) -> int:
-        """从 Yosys 输出解析触发器数量"""
-        # 查找 DFF 相关信息
+        """从 Yosys 输出解析触发器数量。
+        Yosys stat 中 FF 类型包括：
+          无 liberty: $dff, $adff, $sdff, $sdffe, $sdffce, $dffe, $adffe ...
+          有 liberty: $_DFF_P_, $_DFF_PN0_, $_DFFE_PP_, $_SDFF_PP0_ ...
+        """
+        total_ff = 0
+
+        # 方法1：匹配 Yosys stat 输出中所有 DFF 变体行
+        # 格式如：  $adff              12
+        #           $_DFF_PN0_          88
+        dff_line_pattern = re.compile(
+            r"^\s+(\$_?(?:s?d)?ff\w*)\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE
+        )
+        for m in dff_line_pattern.finditer(output):
+            total_ff += int(m.group(2))
+
+        if total_ff > 0:
+            return total_ff
+
+        # 方法2：查找文字描述
         patterns = [
-            r"\$dff\s+(\d+)",
-            r"DFF\s+(\d+)",
             r"flip-flops?\s*:\s*(\d+)",
-            r"registers?\s*:\s*(\d+)"
+            r"registers?\s*:\s*(\d+)",
         ]
-        
         for pattern in patterns:
             matches = re.findall(pattern, output, re.IGNORECASE)
             if matches:
                 return sum(int(m) for m in matches)
-        
-        # 兜底：从 stat 输出估算
-        if "$dff" in output.lower():
-            return len(re.findall(r"\$dff", output, re.IGNORECASE))
-        
-        return 0
+
+        # 方法3：兜底计数所有包含 dff 的 stat 行
+        dff_fallback = re.compile(r"^\s+\S*dff\S*\s+(\d+)", re.IGNORECASE | re.MULTILINE)
+        for m in dff_fallback.finditer(output):
+            total_ff += int(m.group(1))
+
+        return total_ff
     
     def _parse_yosys_logic_depth(self, output: str) -> int:
         """从 Yosys 输出解析逻辑深度"""

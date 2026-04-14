@@ -873,20 +873,46 @@ class AgentOptimizer:
 # ---------------------------------------------------------------------------
 
 def _extract_module_name(code: str) -> Optional[str]:
-    m = re.search(r"\bmodule\s+(\w+)", code, re.IGNORECASE)
-    return m.group(1) if m else None
-
-
-def _detect_top_module(code: str) -> Optional[str]:
+    """Extract top-level module name from Verilog code.
+    For multi-module designs, find the module not instantiated by others."""
     text = re.sub(r"/\*[\s\S]*?\*/", "", code)
     text = re.sub(r"//.*", "", text)
     names = re.findall(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_]*)", text)
     if not names:
         return None
+    if len(names) == 1:
+        return names[0]
+
+    # Find which modules are instantiated inside other modules
+    instantiated = set()
+    for name in names:
+        # Match instantiation: module_name [#(...)] instance_name (
+        pattern = re.compile(
+            r"\b" + re.escape(name) + r"\s+(?:#\s*\([\s\S]*?\)\s*)?[A-Za-z_]\w*\s*\(",
+        )
+        # Check each line, skipping the module declaration line itself
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if re.match(r"\bmodule\s+" + re.escape(name) + r"\b", stripped):
+                continue
+            if pattern.search(stripped):
+                instantiated.add(name)
+                break
+
+    # Top = declared but never instantiated
+    top_candidates = [n for n in names if n not in instantiated]
+    if top_candidates:
+        return top_candidates[-1]
+
+    # Fallback: prefer name containing "top", otherwise last
     for n in names:
-        if n.lower() == "top":
+        if "top" in n.lower():
             return n
-    return names[0]
+    return names[-1]
+
+
+def _detect_top_module(code: str) -> Optional[str]:
+    return _extract_module_name(code)
 
 
 def _has_complete_module(text: str) -> bool:

@@ -275,23 +275,21 @@ table tr:last-child td {
     border: 1px solid rgba(72, 88, 118, 0.35);
     border-radius: 12px;
     min-height: 200px;
-    max-height: 420px;
+    max-height: 480px;
     overflow: auto;
     position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     color: rgba(148, 163, 184, 0.5);
     font-size: 13px;
     resize: vertical;
 }
 
-.circuit-canvas .joint-paper,
-.circuit-canvas svg {
-    max-width: 100%;
-    max-height: 400px;
-    height: auto !important;
-    width: auto !important;
+.circuit-canvas:empty::before {
+    content: attr(data-placeholder);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+    width: 100%;
 }
 
 .circuit-hint {
