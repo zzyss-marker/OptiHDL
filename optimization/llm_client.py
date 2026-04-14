@@ -5,9 +5,6 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class BaseLLMClient:
@@ -34,10 +31,19 @@ class LocalHFClient(BaseLLMClient):
     mode = "local"
 
     def __init__(self, model_path: str):
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self._torch = torch
         self.model_path = model_path
         self.tokenizer, self.model = self._load_model(model_path)
 
-    def _load_model(self, model_path: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+    def _load_model(self, model_path: str):
+        torch = self._torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -105,6 +111,7 @@ class LocalHFClient(BaseLLMClient):
             inputs = self.tokenizer(merged_prompt, return_tensors="pt", truncation=True, max_length=input_max)
 
         input_len = inputs["input_ids"].shape[1]
+        torch = self._torch
         if torch.cuda.is_available():
             inputs = {key: value.cuda() for key, value in inputs.items()}
 
