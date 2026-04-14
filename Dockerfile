@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     flex \
     libeigen3-dev \
     libfl-dev \
+    libgtest-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN yosys -V
@@ -42,11 +43,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 
 RUN node -v && npm -v
 
-# ── Stage 3: Build OpenSTA from source ──
+# ── Stage 3: Build GTest (libgtest-dev ships source only on Ubuntu 22.04) ──
+RUN cd /usr/src/googletest && cmake . && make && make install
+
+# ── Stage 4: Build OpenSTA from source ──
 RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
     && mkdir /tmp/OpenSTA/build \
     && cd /tmp/OpenSTA/build \
-    && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTING=OFF \
+    && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local \
     && make -j"$(nproc)" \
     && make install \
     && rm -rf /tmp/OpenSTA
