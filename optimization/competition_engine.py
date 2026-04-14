@@ -230,7 +230,7 @@ def build_markdown_report(
         summary,
         "",
         "## 技术方案",
-        "系统由 Verilog 代码输入、EDA 分析器、LLM 候选生成器、RL 风格策略调整器、多目标评分器和可解释诊断模块组成。",
+        "系统由 Verilog 代码输入、EDA 分析器、LLM 候选生成器、多目标评分器和可解释诊断模块组成。",
         f"当前优化目标画像：{target_text}。",
         "",
         "## 创新点",

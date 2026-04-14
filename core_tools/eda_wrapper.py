@@ -45,10 +45,10 @@ class EDAWrapper:
             # 1. 语法检查和综合（仅使用 Yosys 指标）
             synth_result = self._run_yosys_synthesis(verilog_code, module_name)
 
-            # 2. 无时序方案：直接返回 Yosys 指标（RL 所需字段）
+            # 2. 直接返回 Yosys 指标
             result = {**synth_result}
 
-            # 3. 验证必需字段（仅 RL 所需）
+            # 3. 验证必需字段
             required_fields = ["syntax_ok", "equiv_ok", "synth_ok", "area", "num_ff", "logic_depth"]
             for field in required_fields:
                 if field not in result:

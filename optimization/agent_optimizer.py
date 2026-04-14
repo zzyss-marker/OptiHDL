@@ -7,7 +7,7 @@ Architecture — four explicit roles:
   Evaluator → calls Yosys / OpenSTA for objective EDA metrics
   Judge     → decides continue / stop based on metrics & history
 
-RLOptimizer is the orchestrator that wires the four roles into a closed
+AgentOptimizer is the orchestrator that wires the four roles into a closed
 loop and reports progress through an optional callback.
 """
 
@@ -504,7 +504,7 @@ class Judge:
 ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 
 
-class RLOptimizer:
+class AgentOptimizer:
     """Orchestrates the Planner → Coder → Evaluator → Judge loop."""
 
     def __init__(
@@ -516,7 +516,7 @@ class RLOptimizer:
         max_new_tokens: int = 1024,
         debug_gen: bool = False,
         debug_dir: Optional[str] = None,
-        rl_mode: bool = True,
+        dynamic_strategy: bool = True,
         base_top_p: float = 0.9,
         base_top_k: int = 50,
         base_rep_penalty: float = 1.05,
@@ -524,7 +524,7 @@ class RLOptimizer:
         self.model_path = model_path
         self.max_iterations = max_iterations
         self.population_size = population_size
-        self.rl_mode = rl_mode
+        self.dynamic_strategy = dynamic_strategy
         self.debug_gen = debug_gen
 
         if debug_dir is None and debug_gen:
@@ -643,7 +643,7 @@ class RLOptimizer:
             logger.info(f"Iteration {iteration}/{effective_max}")
 
             # 2a. Planner refines strategy
-            if self.rl_mode and iteration > 1:
+            if self.dynamic_strategy and iteration > 1:
                 strategy = planner.refine_strategy(
                     plan, score_history,
                     judge.stagnation_count, judge.decline_count,
@@ -995,7 +995,7 @@ def main() -> None:
         print("Please provide --input or --code")
         return
 
-    optimizer = RLOptimizer(
+    optimizer = AgentOptimizer(
         model_path=args.model,
         max_iterations=args.iterations,
         population_size=args.population,

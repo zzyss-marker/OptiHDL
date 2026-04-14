@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core_tools.eda_wrapper import analyze_verilog_api
-from optimization.rl_optimizer import RLOptimizer
+from optimization.agent_optimizer import AgentOptimizer
 
 SETTINGS_FILE = PROJECT_ROOT / "web_app" / "runtime_settings.json"
 
@@ -64,7 +64,7 @@ class OptimizationManager:
         self._model_path = None
         self._config_signature = None
 
-    def ensure_optimizer(self, model_path: str, runtime_settings: dict) -> RLOptimizer:
+    def ensure_optimizer(self, model_path: str, runtime_settings: dict) -> AgentOptimizer:
         config_signature = (
             runtime_settings.get("llm_mode", "auto"),
             runtime_settings.get("api_base_url", ""),
@@ -77,14 +77,14 @@ class OptimizationManager:
                 self._optimizer.cleanup()
             log.info(f"[Manager] initialize optimizer: {model_path}")
             apply_runtime_settings(runtime_settings)
-            self._optimizer = RLOptimizer(
+            self._optimizer = AgentOptimizer(
                 model_path=model_path,
                 max_iterations=10,
                 population_size=1,
                 temperature=0.8,
                 max_new_tokens=1024,
                 debug_gen=False,
-                rl_mode=True,
+                dynamic_strategy=True,
             )
             self._model_path = model_path
             self._config_signature = config_signature

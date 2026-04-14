@@ -42,8 +42,8 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, default=1.05, help="Repetition penalty")
     parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum generated tokens")
     parser.add_argument("--debug-gen", action="store_true", help="Enable generation debug output")
-    parser.add_argument("--rl-mode", action="store_true", default=True, help="Enable dynamic strategy")
-    parser.add_argument("--no-rl", dest="rl_mode", action="store_false", help="Disable dynamic strategy")
+    parser.add_argument("--dynamic-strategy", action="store_true", default=True, help="Enable dynamic strategy")
+    parser.add_argument("--no-dynamic-strategy", dest="dynamic_strategy", action="store_false", help="Disable dynamic strategy")
     parser.add_argument("--debug-dir", type=str, help="Custom debug output directory")
     parser.add_argument("--output", "-o", help="Output directory")
     args = parser.parse_args()
@@ -54,9 +54,9 @@ def main() -> None:
         raise FileNotFoundError(f"Input Verilog file not found: {input_path}")
     code = input_path.read_text(encoding="utf-8", errors="ignore")
 
-    from optimization.rl_optimizer import RLOptimizer
+    from optimization.agent_optimizer import AgentOptimizer
 
-    optimizer = RLOptimizer(
+    optimizer = AgentOptimizer(
         model_path=model_path,
         max_iterations=args.iterations,
         population_size=args.population,
@@ -64,7 +64,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         debug_gen=args.debug_gen,
         debug_dir=args.debug_dir,
-        rl_mode=args.rl_mode,
+        dynamic_strategy=args.dynamic_strategy,
         base_top_p=getattr(args, "top_p", 0.9),
         base_top_k=getattr(args, "top_k", 50),
         base_rep_penalty=getattr(args, "repetition_penalty", 1.05),
