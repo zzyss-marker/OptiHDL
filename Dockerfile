@@ -59,7 +59,7 @@ RUN set -ex \
     && ./configure --prefix=/usr/local \
     && make -j2 \
     && make install \
-    && rm -rf /tmp/cudd \
+    && cd /tmp && rm -rf /tmp/cudd \
     # --- OpenSTA ---
     && git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
     && mkdir /tmp/OpenSTA/build \
