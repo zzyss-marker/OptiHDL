@@ -50,23 +50,24 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # ── 3. Build GTest (Ubuntu 22.04 libgtest-dev ships source only) ──
 RUN cd /usr/src/googletest && cmake . && make && make install
 
-# ── 4. Build CUDD 3.0.0 (autotools, no apt package) ──
-RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/cudd.git /tmp/cudd \
+# ── 4. Build CUDD + OpenSTA (single layer to reduce overhead) ──
+RUN set -ex \
+    # --- CUDD 3.0.0 (autotools) ---
+    && git clone --depth 1 https://github.com/The-OpenROAD-Project/cudd.git /tmp/cudd \
     && cd /tmp/cudd \
     && autoreconf -fi \
     && ./configure --prefix=/usr/local \
-    && make -j"$(nproc)" \
+    && make -j2 \
     && make install \
-    && rm -rf /tmp/cudd
-
-# ── 5. Build OpenSTA from source ──
-RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
+    && rm -rf /tmp/cudd \
+    # --- OpenSTA ---
+    && git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
     && mkdir /tmp/OpenSTA/build \
     && cd /tmp/OpenSTA/build \
     && cmake .. \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DCUDD_DIR=/usr/local \
-    && make -j"$(nproc)" \
+    && make -j2 \
     && make install \
     && rm -rf /tmp/OpenSTA
 
