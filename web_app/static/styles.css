@@ -274,7 +274,8 @@ table tr:last-child td {
     background: rgba(9, 13, 24, 0.92);
     border: 1px solid rgba(72, 88, 118, 0.35);
     border-radius: 12px;
-    min-height: 320px;
+    min-height: 200px;
+    max-height: 420px;
     overflow: auto;
     position: relative;
     display: flex;
@@ -282,11 +283,15 @@ table tr:last-child td {
     justify-content: center;
     color: rgba(148, 163, 184, 0.5);
     font-size: 13px;
+    resize: vertical;
 }
 
 .circuit-canvas .joint-paper,
 .circuit-canvas svg {
-    width: 100% !important;
+    max-width: 100%;
+    max-height: 400px;
+    height: auto !important;
+    width: auto !important;
 }
 
 .circuit-hint {

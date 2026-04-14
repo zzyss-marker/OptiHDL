@@ -9,13 +9,12 @@ DEFAULT_PROFILE = {
     "label": "平衡优化",
     "description": "同时兼顾面积、寄存器数量与逻辑深度，适合通用型数字电路优化。",
     "weights": {
-        "area": 0.40,
+        "area": 0.45,
         "ff": 0.30,
-        "depth": 0.15,
-        "timing": 0.15,
+        "depth": 0.25,
         "pass_bonus": 0.10,
     },
-    "prompt_focus": "优先在不破坏接口与语义的前提下，平衡面积、时序与资源使用。",
+    "prompt_focus": "优先在不破坏接口与语义的前提下，平衡面积与资源使用。",
 }
 
 
@@ -25,7 +24,7 @@ TARGET_PROFILES = [
         "label": "面积优先",
         "description": "面向资源受限部署，重点压缩单元面积和冗余逻辑。",
         "keywords": ["面积", "资源", "成本", "低功耗", "边缘", "resource", "area", "small"],
-        "weights": {"area": 0.55, "ff": 0.20, "depth": 0.10, "timing": 0.15, "pass_bonus": 0.10},
+        "weights": {"area": 0.60, "ff": 0.20, "depth": 0.20, "pass_bonus": 0.10},
         "prompt_focus": "优先减少组合逻辑规模、复用中间信号并消除冗余状态。",
     },
     {
@@ -33,7 +32,7 @@ TARGET_PROFILES = [
         "label": "时序优先",
         "description": "面向高性能场景，重点缩短关键路径并降低逻辑深度。",
         "keywords": ["时序", "延迟", "频率", "吞吐", "高性能", "timing", "latency", "speed", "throughput"],
-        "weights": {"area": 0.15, "ff": 0.15, "depth": 0.30, "timing": 0.40, "pass_bonus": 0.10},
+        "weights": {"area": 0.20, "ff": 0.20, "depth": 0.60, "pass_bonus": 0.10},
         "prompt_focus": "优先拆分长组合路径，压缩关键路径深度并改善高频运行能力。",
     },
     {
@@ -41,7 +40,7 @@ TARGET_PROFILES = [
         "label": "寄存器优先",
         "description": "面向寄存器密集型设计，重点减少触发器与状态冗余。",
         "keywords": ["寄存器", "触发器", "状态机", "flip-flop", "ff", "register"],
-        "weights": {"area": 0.20, "ff": 0.50, "depth": 0.10, "timing": 0.20, "pass_bonus": 0.10},
+        "weights": {"area": 0.20, "ff": 0.55, "depth": 0.25, "pass_bonus": 0.10},
         "prompt_focus": "优先压缩触发器数量、合并状态与寄存器复用。",
     },
     {
@@ -49,7 +48,7 @@ TARGET_PROFILES = [
         "label": "可维护优先",
         "description": "面向工程落地和教学展示，强调结构清晰、可解释与可维护。",
         "keywords": ["可读", "可维护", "解释", "教学", "readable", "maintainable", "explain"],
-        "weights": {"area": 0.30, "ff": 0.20, "depth": 0.30, "timing": 0.20, "pass_bonus": 0.10},
+        "weights": {"area": 0.30, "ff": 0.25, "depth": 0.45, "pass_bonus": 0.10},
         "prompt_focus": "在保证优化收益的同时，使结构更清晰、便于答辩解释与维护。",
     },
 ]

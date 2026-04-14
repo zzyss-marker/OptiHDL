@@ -1,5 +1,5 @@
 # ── OptiHDL Docker Image ──
-# Complete EDA environment: Yosys + OpenSTA + Node.js (DigitalJS)
+# EDA environment: Yosys + Node.js (DigitalJS)
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,7 +10,7 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
-# ── 1. System packages (Yosys + all OpenSTA build deps) ──
+# ── 1. System packages (Yosys) ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
@@ -22,22 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     graphviz \
     xdot \
     yosys \
-    # OpenSTA requires all of these
     tcl-dev \
-    swig \
-    bison \
-    flex \
-    libeigen3-dev \
     libreadline-dev \
     libffi-dev \
-    libfl-dev \
-    libgtest-dev \
-    zlib1g-dev \
-    libfmt-dev \
-    # CUDD autotools build
-    autoconf \
-    automake \
-    libtool \
     && rm -rf /var/lib/apt/lists/*
 
 RUN yosys -V
@@ -47,34 +34,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# ── 3. Build GTest (Ubuntu 22.04 libgtest-dev ships source only) ──
-RUN cd /usr/src/googletest && cmake . && make && make install
+# Verify tools
+RUN yosys -V && node -v
 
-# ── 4. Build CUDD + OpenSTA (single layer to reduce overhead) ──
-RUN set -ex \
-    # --- CUDD 3.0.0 (autotools) ---
-    && git clone --depth 1 https://github.com/The-OpenROAD-Project/cudd.git /tmp/cudd \
-    && cd /tmp/cudd \
-    && autoreconf -fi \
-    && ./configure --prefix=/usr/local \
-    && make -j2 \
-    && make install \
-    && cd /tmp && rm -rf /tmp/cudd \
-    # --- OpenSTA ---
-    && git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
-    && mkdir /tmp/OpenSTA/build \
-    && cd /tmp/OpenSTA/build \
-    && cmake .. \
-        -DCMAKE_INSTALL_PREFIX=/usr/local \
-        -DCUDD_DIR=/usr/local \
-    && make -j2 \
-    && make install \
-    && rm -rf /tmp/OpenSTA
-
-# Verify all EDA tools
-RUN yosys -V && sta -version && node -v
-
-# ── 6. Python environment ──
+# ── 3. Python environment ──
 RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip3 config set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
@@ -83,11 +46,11 @@ RUN pip3 install --no-cache-dir --upgrade pip
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# ── 7. DigitalJS bridge (Node.js deps) ──
+# ── 4. DigitalJS bridge (Node.js deps) ──
 COPY tools/package.json /app/tools/
 RUN cd /app/tools && npm install --production
 
-# ── 8. Application ──
+# ── 5. Application ──
 COPY . /app/
 
 RUN mkdir -p /app/models /app/data /app/logs /app/outputs /app/temp

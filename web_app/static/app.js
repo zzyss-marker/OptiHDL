@@ -559,6 +559,10 @@ function renderCircuit(containerId, circuitJson) {
     try {
         const circuit = new digitaljs.Circuit(circuitJson);
         const paper = circuit.displayOn($(container));
+        // Constrain the paper size so it doesn't blow up the page
+        if (paper && paper.setDimensions) {
+            paper.setDimensions(container.clientWidth - 20, 380);
+        }
         circuit.start();
         return circuit;
     } catch (e) {
