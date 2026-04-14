@@ -6,6 +6,7 @@ import time
 import uuid
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
 from loguru import logger as log
 
@@ -287,8 +288,11 @@ def create_app() -> Flask:
     @app.errorhandler(Exception)
     def handle_api_exception(exc):  # noqa: ANN001
         if request.path.startswith("/api/"):
+            code = exc.code if isinstance(exc, HTTPException) else 500
             log.exception("[API] unhandled exception")
-            return jsonify({"success": False, "error": str(exc)}), 500
+            return jsonify({"success": False, "error": str(exc)}), code
+        if isinstance(exc, HTTPException):
+            return exc
         raise exc
 
     @app.teardown_appcontext
