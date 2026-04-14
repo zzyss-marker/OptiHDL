@@ -10,7 +10,7 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
-# ── Stage 1: System deps + Yosys + Node.js ──
+# ── 1. System packages (Yosys + all OpenSTA build deps) ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
@@ -19,46 +19,59 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
     cmake \
-    tcl-dev \
-    libreadline-dev \
-    libffi-dev \
     graphviz \
     xdot \
     yosys \
-    # OpenSTA build dependencies
+    # OpenSTA requires all of these
+    tcl-dev \
     swig \
     bison \
     flex \
     libeigen3-dev \
+    libreadline-dev \
+    libffi-dev \
     libfl-dev \
     libgtest-dev \
+    zlib1g-dev \
+    libfmt-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN yosys -V
 
-# ── Stage 2: Node.js 20 LTS (for yosys2digitaljs) ──
+# ── 2. Node.js 20 LTS (for yosys2digitaljs) ──
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN node -v && npm -v
-
-# ── Stage 3: Build GTest (libgtest-dev ships source only on Ubuntu 22.04) ──
+# ── 3. Build GTest (Ubuntu 22.04 libgtest-dev ships source only) ──
 RUN cd /usr/src/googletest && cmake . && make && make install
 
-# ── Stage 4: Build OpenSTA from source ──
+# ── 4. Build CUDD 3.0.0 (no apt package available) ──
+RUN curl -fsSL https://github.com/The-OpenROAD-Project/cudd/archive/refs/heads/master.tar.gz \
+        -o /tmp/cudd.tar.gz \
+    && mkdir -p /tmp/cudd && tar xzf /tmp/cudd.tar.gz -C /tmp/cudd --strip-components=1 \
+    && cd /tmp/cudd \
+    && mkdir build && cd build \
+    && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /tmp/cudd /tmp/cudd.tar.gz
+
+# ── 5. Build OpenSTA from source ──
 RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
     && mkdir /tmp/OpenSTA/build \
     && cd /tmp/OpenSTA/build \
-    && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCUDD_DIR=/usr/local \
     && make -j"$(nproc)" \
     && make install \
     && rm -rf /tmp/OpenSTA
 
-# Verify EDA tools
-RUN yosys -V && sta -version
+# Verify all EDA tools
+RUN yosys -V && sta -version && node -v
 
-# ── Stage 4: Python environment ──
+# ── 6. Python environment ──
 RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip3 config set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
@@ -67,11 +80,11 @@ RUN pip3 install --no-cache-dir --upgrade pip
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# ── Stage 5: DigitalJS bridge (Node.js deps) ──
+# ── 7. DigitalJS bridge (Node.js deps) ──
 COPY tools/package.json /app/tools/
 RUN cd /app/tools && npm install --production
 
-# ── Stage 6: Application ──
+# ── 8. Application ──
 COPY . /app/
 
 RUN mkdir -p /app/models /app/data /app/logs /app/outputs /app/temp
