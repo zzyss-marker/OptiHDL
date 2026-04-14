@@ -15,7 +15,7 @@ services:
       - ./web_app:/app/web_app
       - ./core_tools:/app/core_tools
       - ./optimization:/app/optimization
-      - ./tools:/app/tools
+      - ./tools/yosys2djs.js:/app/tools/yosys2djs.js
       - ./run_optihdl.py:/app/run_optihdl.py
       # Data directories
       - ./models:/app/models
