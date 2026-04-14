@@ -513,11 +513,12 @@ function updateOptimizationResult(result) {
     renderMetrics(result);
     renderAgentDecisions(result);
 
-    // Show circuit section and store codes for later generation
+    // Show circuit section and auto-generate circuit links
     const circuitSection = document.getElementById("circuit-section");
     circuitSection.style.display = "";
     circuitSection._originalCode = result.original_code;
     circuitSection._optimizedCode = result.optimized_code;
+    generateCircuits();
 
     const llmMode = result.llm_mode ? `，模式 ${result.llm_mode}` : "";
     setStatus(`优化完成${llmMode}`, "success");
@@ -570,36 +571,17 @@ document.getElementById("toggle-optimized").addEventListener("click", () => {
 });
 btnSaveSettings.addEventListener("click", saveSettings);
 
-/* ─── Circuit simulation (DigitalJS) ─── */
-let circuitInstances = { original: null, optimized: null };
+/* ─── Circuit generation (link-based) ─── */
 
-async function fetchCircuitJson(code) {
+async function generateCircuitLink(code, label) {
     const modMatch = code.match(/module\s+(\w+)/);
     const moduleName = modMatch ? modMatch[1] : "top";
     const response = await fetch("/api/circuit_json", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, module: moduleName }),
+        body: JSON.stringify({ code, module: moduleName, label }),
     });
     return response.json();
-}
-
-function renderCircuit(containerId, circuitJson) {
-    const container = document.getElementById(containerId);
-    container.textContent = "";
-    if (typeof digitaljs === "undefined") {
-        container.textContent = "DigitalJS library not loaded";
-        return null;
-    }
-    try {
-        const circuit = new digitaljs.Circuit(circuitJson);
-        const paper = circuit.displayOn($(container));
-        circuit.start();
-        return circuit;
-    } catch (e) {
-        container.textContent = "Circuit render error: " + e.message;
-        return null;
-    }
 }
 
 async function generateCircuits() {
@@ -608,43 +590,40 @@ async function generateCircuits() {
     const optCode = section._optimizedCode;
     if (!origCode || !optCode) return;
 
-    const btn = document.getElementById("btn-gen-circuit");
-    btn.disabled = true;
-    btn.textContent = "生成中…";
+    const linkOrig = document.getElementById("link-circuit-original");
+    const linkOpt = document.getElementById("link-circuit-optimized");
+    const statusEl = document.getElementById("circuit-status");
 
-    // Clean up previous instances
-    if (circuitInstances.original) { circuitInstances.original.stop(); circuitInstances.original = null; }
-    if (circuitInstances.optimized) { circuitInstances.optimized.stop(); circuitInstances.optimized = null; }
-    document.getElementById("circuit-original").textContent = "加载中…";
-    document.getElementById("circuit-optimized").textContent = "加载中…";
+    linkOrig.classList.add("disabled");
+    linkOpt.classList.add("disabled");
+    statusEl.textContent = "正在生成电路图...";
 
     try {
         const [origResult, optResult] = await Promise.all([
-            fetchCircuitJson(origCode),
-            fetchCircuitJson(optCode),
+            generateCircuitLink(origCode, "原始电路"),
+            generateCircuitLink(optCode, "优化后电路"),
         ]);
 
         if (origResult.success) {
-            circuitInstances.original = renderCircuit("circuit-original", origResult.output);
+            linkOrig.href = `/circuit/${origResult.circuit_id}`;
+            linkOrig.classList.remove("disabled");
         } else {
-            document.getElementById("circuit-original").textContent = origResult.error || "Failed";
+            linkOrig.querySelector(".link-text").textContent = "生成失败: " + (origResult.error || "").slice(0, 60);
         }
 
         if (optResult.success) {
-            circuitInstances.optimized = renderCircuit("circuit-optimized", optResult.output);
+            linkOpt.href = `/circuit/${optResult.circuit_id}`;
+            linkOpt.classList.remove("disabled");
         } else {
-            document.getElementById("circuit-optimized").textContent = optResult.error || "Failed";
+            linkOpt.querySelector(".link-text").textContent = "生成失败: " + (optResult.error || "").slice(0, 60);
         }
 
-        addLogEntry("电路仿真图已生成", "success");
+        statusEl.textContent = "点击链接在新页面中查看交互式电路图";
+        addLogEntry("电路图链接已生成", "success");
     } catch (err) {
+        statusEl.textContent = "电路图生成失败: " + err.message;
         addLogEntry(`电路图生成失败: ${err.message}`, "error");
-    } finally {
-        btn.disabled = false;
-        btn.textContent = "生成电路图";
     }
 }
-
-document.getElementById("btn-gen-circuit").addEventListener("click", generateCircuits);
 
 loadSettings();

@@ -140,6 +140,7 @@ def create_app() -> Flask:
     runtime_settings = load_runtime_settings()
     apply_runtime_settings(runtime_settings)
     jobs: dict[str, dict] = {}
+    circuit_cache: dict[str, dict] = {}  # id → {"json": ..., "label": ..., "created": ...}
 
     def start_job(job_type: str, target_fn, *args):
         job_id = uuid.uuid4().hex
@@ -287,11 +288,12 @@ def create_app() -> Flask:
 
     @app.route("/api/circuit_json", methods=["POST"])
     def api_circuit_json():
-        """Convert Verilog to DigitalJS JSON via yosys2digitaljs."""
+        """Convert Verilog to DigitalJS JSON, cache it, return an ID for the viewer page."""
         import subprocess as _sp
         payload = request.get_json(force=True)
         code = payload.get("code", "")
         module_name = payload.get("module", "top")
+        label = payload.get("label", "circuit")
         if not code.strip():
             return jsonify({"success": False, "error": "No code provided"}), 400
 
@@ -307,14 +309,43 @@ def create_app() -> Flask:
                 input=_json.dumps({"code": code, "module": module_name}),
                 capture_output=True, text=True, timeout=60,
             )
+            if not proc.stdout.strip():
+                stderr_hint = (proc.stderr or "")[:500]
+                return jsonify({"success": False, "error": f"yosys2digitaljs returned empty output. {stderr_hint}"}), 500
             result = _json.loads(proc.stdout)
-            return jsonify(result)
+            if not result.get("success"):
+                return jsonify(result), 500
+
+            # Cache the circuit JSON and return an ID
+            cid = uuid.uuid4().hex[:12]
+            circuit_cache[cid] = {
+                "json": result.get("output", {}),
+                "label": label,
+                "created": time.time(),
+            }
+            return jsonify({"success": True, "circuit_id": cid})
         except FileNotFoundError:
             return jsonify({"success": False, "error": "Node.js not installed"}), 500
         except _sp.TimeoutExpired:
             return jsonify({"success": False, "error": "Circuit generation timed out"}), 504
         except Exception as exc:
             return jsonify({"success": False, "error": str(exc)}), 500
+
+    @app.route("/api/circuit_data/<cid>", methods=["GET"])
+    def api_circuit_data(cid: str):
+        """Return cached circuit JSON for the viewer page."""
+        entry = circuit_cache.get(cid)
+        if not entry:
+            return jsonify({"success": False, "error": "Circuit not found or expired"}), 404
+        return jsonify({"success": True, "circuit": entry["json"], "label": entry["label"]})
+
+    @app.route("/circuit/<cid>")
+    def circuit_viewer(cid: str):
+        """Standalone circuit viewer page."""
+        entry = circuit_cache.get(cid)
+        if not entry:
+            return "Circuit not found or expired", 404
+        return render_template("circuit.html", circuit_id=cid, label=entry["label"])
 
     @app.errorhandler(Exception)
     def handle_api_exception(exc):  # noqa: ANN001

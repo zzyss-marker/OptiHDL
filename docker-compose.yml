@@ -8,6 +8,8 @@ services:
     container_name: optihdl-web
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     volumes:
       # Mount source code so changes take effect without rebuild
       - ./web_app:/app/web_app
@@ -22,11 +24,6 @@ services:
       - ./outputs:/app/outputs
     environment:
       - PYTHONUNBUFFERED=1
-      # API mode
-      # - OPTIHDL_LLM_MODE=api
-      # - OPTIHDL_API_BASE_URL=http://host.docker.internal:8000/v1
-      # - OPTIHDL_API_KEY=your-key
-      # - OPTIHDL_API_MODEL=qwen2.5-coder
     # gunicorn --reload watches mounted files, restarts on change
     command: ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "300", "--reload", "web_app.app:create_app()"]
     restart: unless-stopped

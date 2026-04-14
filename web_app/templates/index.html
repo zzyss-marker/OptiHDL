@@ -5,8 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>OptiHDL Agent Console</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-    <!-- DigitalJS dependencies -->
-    <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+    <!-- DigitalJS dependencies only on /circuit/<id> page -->
 </head>
 <body>
 <header>
@@ -129,26 +128,25 @@
         </div>
     </section>
 
-    <!-- Circuit Simulation -->
+    <!-- Circuit Links -->
     <section class="panel" id="circuit-section" style="display:none;">
-        <h2>电路仿真 <button id="btn-gen-circuit" class="toggle-btn" style="margin-left:12px;">生成电路图</button></h2>
-        <div class="circuit-compare">
-            <div class="circuit-panel">
-                <h4>原始电路</h4>
-                <div id="circuit-original" class="circuit-canvas">点击「生成电路图」查看</div>
-            </div>
-            <div class="circuit-panel">
-                <h4>优化后电路</h4>
-                <div id="circuit-optimized" class="circuit-canvas">点击「生成电路图」查看</div>
-            </div>
+        <h2>电路仿真</h2>
+        <div class="circuit-links">
+            <a id="link-circuit-original" href="#" target="_blank" class="circuit-link">
+                <span class="link-icon">O</span>
+                <span class="link-text">查看原始电路</span>
+            </a>
+            <a id="link-circuit-optimized" href="#" target="_blank" class="circuit-link">
+                <span class="link-icon">N</span>
+                <span class="link-text">查看优化后电路</span>
+            </a>
         </div>
-        <p class="circuit-hint">拨动输入信号可实时查看输出变化</p>
+        <div id="circuit-status" class="circuit-hint"></div>
     </section>
 </main>
 <footer>
     <p>OptiHDL Agent</p>
 </footer>
-<script src="https://cdn.jsdelivr.net/npm/digitaljs/dist/main.js"></script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

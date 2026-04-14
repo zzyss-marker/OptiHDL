@@ -62,3 +62,6 @@ docker-compose.yml
 # 其他
 .DS_Store
 Thumbs.db
+.env
+.env.*
+!.env.example
