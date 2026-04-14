@@ -30,11 +30,44 @@
             <input id="api-key-input" type="password" placeholder="API Key" style="flex:1; min-width:260px;">
             <button id="btn-save-settings" class="primary">保存配置</button>
         </div>
-        <pre class="result-block" id="settings-help">ENV fallback:
-OPTIHDL_LLM_MODE=api|local|auto
-OPTIHDL_API_BASE_URL=...
-OPTIHDL_API_KEY=...
-OPTIHDL_API_MODEL=...</pre>
+    </section>
+
+    <section class="panel" id="agent-pipeline-panel">
+        <h2>Agent Pipeline</h2>
+        <div class="pipeline-wrap">
+            <div class="pipeline-row">
+                <div class="agent-node" id="node-planner">
+                    <div class="node-ring"><span>P</span></div>
+                    <div class="node-label">Planner</div>
+                    <div class="node-sub">分析 &amp; 策略</div>
+                    <div class="node-status" id="st-planner">idle</div>
+                </div>
+                <div class="pipe" id="pipe-pc"><div class="pipe-track"><div class="pipe-dot"></div></div></div>
+                <div class="agent-node" id="node-coder">
+                    <div class="node-ring"><span>C</span></div>
+                    <div class="node-label">Coder</div>
+                    <div class="node-sub">LLM 生成</div>
+                    <div class="node-status" id="st-coder">idle</div>
+                </div>
+                <div class="pipe" id="pipe-ce"><div class="pipe-track"><div class="pipe-dot"></div></div></div>
+                <div class="agent-node" id="node-evaluator">
+                    <div class="node-ring"><span>E</span></div>
+                    <div class="node-label">Evaluator</div>
+                    <div class="node-sub">EDA 评估</div>
+                    <div class="node-status" id="st-evaluator">idle</div>
+                </div>
+                <div class="pipe" id="pipe-ej"><div class="pipe-track"><div class="pipe-dot"></div></div></div>
+                <div class="agent-node" id="node-judge">
+                    <div class="node-ring"><span>J</span></div>
+                    <div class="node-label">Judge</div>
+                    <div class="node-sub">决策控制</div>
+                    <div class="node-status" id="st-judge">idle</div>
+                </div>
+            </div>
+            <div class="feedback-arc" id="feedback-arc">
+                <span class="feedback-text" id="feedback-text"></span>
+            </div>
+        </div>
     </section>
 
     <section class="panel">

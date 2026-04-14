@@ -258,6 +258,188 @@ footer {
     color: rgba(148, 163, 184, 0.6);
 }
 
+/* ─── Agent Pipeline ─── */
+.pipeline-wrap {
+    position: relative;
+    padding: 24px 0 12px;
+}
+
+.pipeline-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+    position: relative;
+    z-index: 2;
+}
+
+/* ── Node ── */
+.agent-node {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 14px 18px 12px;
+    background: rgba(15, 20, 35, 0.92);
+    border: 2px solid rgba(72, 88, 118, 0.3);
+    border-radius: 14px;
+    min-width: 108px;
+    transition: border-color 0.5s, box-shadow 0.5s, transform 0.4s;
+}
+
+.node-ring {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 17px;
+    background: rgba(56, 189, 248, 0.1);
+    border: 2px solid rgba(56, 189, 248, 0.25);
+    color: #38bdf8;
+    transition: all 0.5s;
+}
+
+.node-label {
+    font-weight: 600;
+    font-size: 13px;
+    color: #e2e8f0;
+}
+
+.node-sub {
+    font-size: 11px;
+    color: rgba(148, 163, 184, 0.7);
+}
+
+.node-status {
+    font-size: 11px;
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    color: rgba(148, 163, 184, 0.5);
+    min-height: 16px;
+    transition: color 0.3s;
+}
+
+/* Active state */
+.agent-node.active {
+    border-color: #38bdf8;
+    box-shadow: 0 0 24px rgba(56, 189, 248, 0.2), 0 0 56px rgba(56, 189, 248, 0.06);
+    transform: translateY(-3px);
+}
+
+.agent-node.active .node-ring {
+    background: rgba(56, 189, 248, 0.25);
+    border-color: #38bdf8;
+    animation: ring-pulse 2s ease-in-out infinite;
+}
+
+.agent-node.active .node-status {
+    color: #7dd3fc;
+}
+
+/* Done state */
+.agent-node.done {
+    border-color: rgba(34, 197, 94, 0.5);
+}
+
+.agent-node.done .node-ring {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: rgba(34, 197, 94, 0.55);
+    color: #4ade80;
+    animation: none;
+}
+
+.agent-node.done .node-status {
+    color: #86efac;
+}
+
+@keyframes ring-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.35); }
+    50%      { box-shadow: 0 0 14px 4px rgba(56, 189, 248, 0.5); }
+}
+
+/* ── Pipe (connector) ── */
+.pipe {
+    width: 52px;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.pipe-track {
+    flex: 1;
+    height: 3px;
+    border-radius: 2px;
+    background: rgba(72, 88, 118, 0.3);
+    position: relative;
+    overflow: hidden;
+}
+
+.pipe-dot {
+    position: absolute;
+    top: -2px;
+    left: -14px;
+    width: 14px;
+    height: 7px;
+    border-radius: 4px;
+    background: transparent;
+    transition: background 0.3s;
+}
+
+.pipe.active .pipe-track {
+    background: rgba(56, 189, 248, 0.35);
+}
+
+.pipe.active .pipe-dot {
+    background: #38bdf8;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.7);
+    animation: dot-flow 0.9s ease-in-out infinite;
+}
+
+@keyframes dot-flow {
+    0%   { left: -14px; opacity: 0; }
+    15%  { opacity: 1; }
+    85%  { opacity: 1; }
+    100% { left: 100%; opacity: 0; }
+}
+
+/* ── Feedback arc ── */
+.feedback-arc {
+    margin: 0 auto;
+    width: 78%;
+    height: 28px;
+    border: 2px dashed rgba(139, 92, 246, 0.2);
+    border-top: none;
+    border-radius: 0 0 14px 14px;
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    opacity: 0;
+    transition: opacity 0.5s, border-color 0.5s;
+}
+
+.feedback-arc.active {
+    opacity: 1;
+    border-color: rgba(139, 92, 246, 0.55);
+    animation: arc-glow 3s ease-in-out infinite;
+}
+
+@keyframes arc-glow {
+    0%, 100% { border-color: rgba(139, 92, 246, 0.35); }
+    50%      { border-color: rgba(139, 92, 246, 0.7); }
+}
+
+.feedback-text {
+    font-size: 11px;
+    color: rgba(167, 139, 250, 0.85);
+    background: rgba(13, 17, 28, 0.95);
+    padding: 0 10px;
+    position: relative;
+    top: 8px;
+    white-space: nowrap;
+}
+
 @media (max-width: 768px) {
     main {
         padding: 16px;

@@ -1,9 +1,14 @@
 """
 Module 3: Agent-driven optimization loop for Verilog.
 
-The optimizer uses an LLM to generate candidate HDL, calls external EDA tools to
-measure objective metrics, and then lets the model act as an agent that decides
-whether the loop should continue based on the observed results.
+Architecture — four explicit roles:
+  Planner   → analyzes code structure, estimates complexity, sets strategy
+  Coder     → generates optimized Verilog candidates via LLM
+  Evaluator → calls Yosys / OpenSTA for objective EDA metrics
+  Judge     → decides continue / stop based on metrics & history
+
+RLOptimizer is the orchestrator that wires the four roles into a closed
+loop and reports progress through an optional callback.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ import re
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from loguru import logger
 
@@ -23,12 +28,484 @@ from optimization.competition_engine import (
     build_target_profile,
     generate_ai_insights,
     generate_competition_package,
+    summarize_code_features,
 )
-from optimization.llm_client import build_llm_client
+from optimization.llm_client import BaseLLMClient, build_llm_client
+
+# ---------------------------------------------------------------------------
+# Planner
+# ---------------------------------------------------------------------------
+
+class Planner:
+    """Analyzes code structure, estimates task complexity, and sets the
+    optimization strategy for the Coder."""
+
+    def analyze(
+        self,
+        code: str,
+        metrics: Dict[str, Any],
+        target_profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create the initial optimization plan."""
+        features = summarize_code_features(code)
+        complexity = self._estimate_complexity(features, metrics)
+        bottlenecks = self._identify_bottlenecks(metrics, features, target_profile)
+        strategy = self._initial_strategy(bottlenecks, target_profile)
+
+        return {
+            "complexity": complexity,
+            "features": features,
+            "bottlenecks": bottlenecks,
+            "strategy": strategy,
+            # Dynamic budgets — simple tasks finish fast, complex ones get room
+            "min_iterations": {"simple": 2, "medium": 2, "complex": 3}[complexity],
+            "stagnation_patience": {"simple": 2, "medium": 3, "complex": 4}[complexity],
+            "suggested_max_iterations": {"simple": 5, "medium": 8, "complex": 10}[complexity],
+        }
+
+    def refine_strategy(
+        self,
+        plan: Dict[str, Any],
+        score_history: List[float],
+        stagnation_count: int,
+        decline_count: int,
+    ) -> str:
+        """Return an updated strategy key after each iteration."""
+        if decline_count >= 2:
+            return "aggressive_restructure"
+        if stagnation_count >= 2:
+            return "explore_alternative"
+        if len(score_history) >= 2 and score_history[-1] > score_history[-2]:
+            return "exploit_current"
+        return plan.get("strategy", "balanced")
+
+    # -- internals ----------------------------------------------------------
+
+    def _estimate_complexity(
+        self, features: Dict[str, Any], metrics: Dict[str, Any],
+    ) -> str:
+        lines = features.get("line_count", 0)
+        always = features.get("always_count", 0)
+        modules = features.get("module_count", 1)
+        if lines <= 30 and always <= 2 and modules <= 1:
+            return "simple"
+        if lines <= 80 and always <= 5:
+            return "medium"
+        return "complex"
+
+    def _identify_bottlenecks(
+        self,
+        metrics: Dict[str, Any],
+        features: Dict[str, Any],
+        profile: Dict[str, Any],
+    ) -> List[str]:
+        bottlenecks: List[str] = []
+        area = float(metrics.get("area", 0) or 0)
+        ff = float(metrics.get("num_ff", 0) or 0)
+        depth = float(metrics.get("logic_depth", 0) or 0)
+        weights = profile.get("weights", {})
+
+        if weights.get("area", 0) >= 0.4 and area > 50:
+            bottlenecks.append("area")
+        if weights.get("ff", 0) >= 0.3 and ff > 8:
+            bottlenecks.append("registers")
+        if weights.get("depth", 0) >= 0.3 and depth > 8:
+            bottlenecks.append("logic_depth")
+        return bottlenecks or ["general"]
+
+    def _initial_strategy(
+        self, bottlenecks: List[str], profile: Dict[str, Any],
+    ) -> str:
+        if "area" in bottlenecks:
+            return "reduce_area"
+        if "registers" in bottlenecks:
+            return "reduce_registers"
+        if "logic_depth" in bottlenecks:
+            return "reduce_depth"
+        return "balanced"
+
+
+# ---------------------------------------------------------------------------
+# Coder
+# ---------------------------------------------------------------------------
+
+class Coder:
+    """Generates optimized Verilog candidates via the LLM."""
+
+    def __init__(
+        self,
+        llm_client: BaseLLMClient,
+        target_profile: Dict[str, Any],
+        max_new_tokens: int = 1024,
+        base_temperature: float = 0.8,
+        base_top_p: float = 0.9,
+        base_top_k: int = 50,
+        base_rep_penalty: float = 1.05,
+        debug_gen: bool = False,
+        debug_dir: Optional[str] = None,
+    ):
+        self.llm_client = llm_client
+        self.target_profile = target_profile
+        self.max_new_tokens = max_new_tokens
+        self.base_temperature = base_temperature
+        self.temperature = base_temperature
+        self.base_top_p = base_top_p
+        self.base_top_k = base_top_k
+        self.base_rep_penalty = base_rep_penalty
+        self.exploration_factor = 0.3
+        self.debug_gen = debug_gen
+        self.debug_dir = debug_dir
+
+    # -- public API ---------------------------------------------------------
+
+    def generate_candidates(
+        self,
+        base_code: str,
+        plan: Dict[str, Any],
+        iteration: int,
+        current_score: float,
+        current_metrics: Dict[str, Any],
+        target_description: str,
+        population_size: int = 1,
+    ) -> List[str]:
+        prompt = self._build_prompt(
+            base_code, plan, iteration, current_score, current_metrics, target_description,
+        )
+
+        candidates: List[str] = []
+        for i in range(population_size):
+            try:
+                raw = self._generate_single(prompt, iteration, i + 1)
+                if not raw:
+                    continue
+                if self._is_meaningfully_different(base_code, raw):
+                    candidates.append(raw)
+                elif plan.get("strategy") in ("aggressive_restructure", "explore_alternative"):
+                    candidates.append(raw)
+            except Exception as exc:
+                logger.warning(f"Candidate generation failed #{i + 1}: {exc}")
+
+        logger.info(f"Generated {len(candidates)} valid candidates")
+        return candidates
+
+    def update_sampling(self, strategy: str, exploration_factor: float) -> None:
+        """Adjust sampling hyper-parameters based on the current strategy."""
+        self.exploration_factor = exploration_factor
+        if strategy == "aggressive_restructure":
+            self.temperature = min(1.3, self.base_temperature + 0.3)
+        elif strategy == "explore_alternative":
+            self.temperature = min(1.1, self.base_temperature + 0.2)
+        elif strategy == "exploit_current":
+            self.temperature = max(0.6, self.base_temperature - 0.1)
+        else:
+            # Gently decay toward base
+            self.temperature += (self.base_temperature - self.temperature) * 0.3
+
+    # -- prompt construction ------------------------------------------------
+
+    def _build_prompt(
+        self,
+        base_code: str,
+        plan: Dict[str, Any],
+        iteration: int,
+        score: float,
+        metrics: Dict[str, Any],
+        target_description: str,
+    ) -> str:
+        constraints = self._build_constraints(plan, iteration, score, metrics)
+        profile_hint = self.target_profile.get("prompt_focus", "")
+        if target_description:
+            return (
+                f"请优化以下 Verilog 代码，目标是：{target_description}。"
+                f"{profile_hint} {constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
+            )
+        return (
+            f"请优化以下 Verilog 代码，使其在资源和时序上更优。"
+            f"{profile_hint} {constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
+        )
+
+    def _build_constraints(
+        self, plan: Dict[str, Any], iteration: int, score: float, metrics: Dict[str, Any],
+    ) -> str:
+        base = (
+            "要求：1) 必须严格保持顶层模块名、端口列表、位宽和方向一致；"
+            "2) 只修改模块内部实现，不改变功能语义；"
+            "3) 仅输出完整 Verilog 代码，不要输出解释。"
+        )
+        hints: List[str] = []
+        strategy = plan.get("strategy", "balanced")
+        if strategy == "aggressive_restructure":
+            hints.append("4) 请尝试完全不同的实现思路，如重构状态机、资源共享或关键路径重写；")
+        elif strategy == "explore_alternative":
+            hints.append("4) 前几轮优化效果有限，请换一个角度尝试优化；")
+        elif strategy == "exploit_current":
+            hints.append("4) 当前方向有效，继续做保守的细粒度优化；")
+        else:
+            hints.append("4) 优先做常量折叠、冗余消除和表达式简化等安全优化；")
+
+        bottlenecks = plan.get("bottlenecks", [])
+        if "area" in bottlenecks:
+            hints.append("5) 面积是主要瓶颈，请优先减少重复逻辑和中间信号。")
+        elif "registers" in bottlenecks:
+            hints.append("5) 寄存器数量偏多，请优先考虑寄存器复用和状态压缩。")
+        elif "logic_depth" in bottlenecks:
+            hints.append("5) 逻辑深度偏高，请优先缩短关键路径。")
+        else:
+            hints.append(f"5) 当前得分 {score:.4f}，请做小步有效的结构优化。")
+
+        hints.append(f"6) 当前第 {iteration} 轮优化。")
+        return base + "".join(hints)
+
+    # -- single generation --------------------------------------------------
+
+    def _generate_single(
+        self, prompt: str, iteration: int, cand_idx: int,
+    ) -> Optional[str]:
+        ef = self.exploration_factor
+        dynamic_top_p = max(0.7, min(0.95, self.base_top_p + (ef - 0.3) * 0.2))
+        dynamic_top_k = max(30, min(80, int(self.base_top_k + (ef - 0.3) * 50)))
+        dynamic_rep = max(1.0, min(1.15, self.base_rep_penalty + (ef - 0.3) * 0.1))
+
+        generated = self.llm_client.generate(
+            prompt,
+            system_prompt="你是面向 Verilog 代码优化任务的 AI Agent，需要结合外部 EDA 指标持续改进代码。",
+            temperature=self.temperature,
+            max_new_tokens=self.max_new_tokens,
+            top_p=dynamic_top_p,
+            top_k=dynamic_top_k,
+            repetition_penalty=dynamic_rep,
+        )
+        if not generated:
+            return None
+
+        self._dump(iteration, cand_idx, "generated_tail.txt", generated)
+        self._dump(iteration, cand_idx, "prompt.txt", prompt)
+
+        code = _extract_code_block(generated).strip()
+        self._dump(iteration, cand_idx, "extracted.v", code)
+
+        if not code and "优化后的代码" in generated:
+            code = generated.split("优化后的代码")[-1].strip(":： \n")
+
+        return code.strip() or None
+
+    # -- helpers ------------------------------------------------------------
+
+    def _is_meaningfully_different(
+        self, base: str, cand: str, threshold: float = 0.98,
+    ) -> bool:
+        bn = _normalize_code(base)
+        cn = _normalize_code(cand)
+        if not cn or bn == cn:
+            return False
+        return SequenceMatcher(a=bn, b=cn).ratio() < threshold
+
+    def _dump(self, iteration: int, cand_idx: int, name: str, content: str) -> None:
+        if not self.debug_gen or not self.debug_dir:
+            return
+        try:
+            d = Path(self.debug_dir) / f"iter_{iteration:02d}" / f"cand_{cand_idx:02d}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / name).write_text(content or "", encoding="utf-8")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Evaluator
+# ---------------------------------------------------------------------------
+
+class Evaluator:
+    """Calls EDA tools (Yosys / OpenSTA) to measure objective metrics."""
+
+    def __init__(self, eda: EDAWrapper):
+        self.eda = eda
+
+    def evaluate(self, code: str, module_name: str) -> Dict[str, Any]:
+        return analyze_verilog_api(code, module_name)
+
+    def score(self, metrics: Dict[str, Any], weights: Dict[str, Any]) -> float:
+        area_w = float(weights.get("area", 0.45))
+        ff_w = float(weights.get("ff", 0.35))
+        depth_w = float(weights.get("depth", 0.20))
+        pass_w = float(weights.get("pass_bonus", 0.10))
+
+        pass_bonus = 0.0
+        if metrics.get("syntax_ok"):
+            pass_bonus += 1.0
+        if metrics.get("synth_ok"):
+            pass_bonus += 1.0
+        if metrics.get("equiv_ok"):
+            pass_bonus += 1.0
+
+        area = max(0.0, float(metrics.get("area", 0)))
+        ff = max(0.0, float(metrics.get("num_ff", 0)))
+        depth = max(0.0, float(metrics.get("logic_depth", 0)))
+
+        return (
+            area_w * (1.0 / (1.0 + area / 1000.0))
+            + ff_w * (1.0 / (1.0 + ff / 1000.0))
+            + depth_w * (1.0 / (1.0 + depth / 10.0))
+            + pass_w * pass_bonus
+        )
+
+
+# ---------------------------------------------------------------------------
+# Judge
+# ---------------------------------------------------------------------------
+
+class Judge:
+    """Decides whether the optimization loop should continue or stop.
+
+    Uses heuristic rules first; falls back to LLM only for ambiguous cases
+    on complex designs.
+    """
+
+    def __init__(self, llm_client: BaseLLMClient, max_iterations: int):
+        self.llm_client = llm_client
+        self.max_iterations = max_iterations
+        self.improvement_streak = 0
+        self.stagnation_count = 0
+        self.decline_count = 0
+
+    def update_tracking(self, improved: bool, declined: bool) -> None:
+        if improved:
+            self.improvement_streak += 1
+            self.stagnation_count = 0
+            self.decline_count = 0
+        elif declined:
+            self.improvement_streak = 0
+            self.stagnation_count += 1
+            self.decline_count += 1
+        else:
+            self.improvement_streak = 0
+            self.stagnation_count += 1
+
+    def decide(
+        self,
+        iteration: int,
+        plan: Dict[str, Any],
+        score_history: List[float],
+        initial_metrics: Dict[str, Any],
+        best_metrics: Dict[str, Any],
+        best_score: float,
+        latest_score: float,
+        target_description: str,
+    ) -> Dict[str, Any]:
+        min_iters = plan.get("min_iterations", 2)
+        patience = plan.get("stagnation_patience", 3)
+
+        # Rule 1: always run minimum iterations
+        if iteration < min_iters:
+            return self._cont(f"最低迭代要求 {min_iters} 轮，当前第 {iteration} 轮。")
+
+        # Rule 2: max budget
+        if iteration >= self.max_iterations:
+            return self._stop(f"已达最大迭代次数 {self.max_iterations}。")
+
+        # Rule 3: stagnation beyond patience
+        if self.stagnation_count >= patience:
+            return self._stop(
+                f"连续 {self.stagnation_count} 轮未改进（耐心阈值 {patience}），停止。",
+            )
+
+        # Rule 4: persistent decline
+        if self.decline_count >= patience + 1:
+            return self._stop(f"连续 {self.decline_count} 轮下降，停止。")
+
+        # Rule 5: still improving — keep going
+        if self.improvement_streak >= 1:
+            return self._cont(
+                f"连续 {self.improvement_streak} 轮改进，继续当前方向。",
+                focus="exploit",
+            )
+
+        # Rule 6: for complex designs with moderate stagnation, ask the LLM
+        if plan.get("complexity") == "complex" and self.stagnation_count >= 2:
+            return self._llm_decide(
+                iteration, initial_metrics, best_metrics,
+                best_score, latest_score, target_description,
+            )
+
+        return self._cont("优化仍有潜力，继续搜索。")
+
+    @property
+    def exploration_factor(self) -> float:
+        if self.decline_count >= 2:
+            return min(0.9, 0.3 + self.decline_count * 0.15)
+        if self.stagnation_count >= 2:
+            return min(0.7, 0.3 + self.stagnation_count * 0.1)
+        if self.improvement_streak >= 2:
+            return max(0.1, 0.3 - self.improvement_streak * 0.05)
+        return 0.3
+
+    # -- internals ----------------------------------------------------------
+
+    def _cont(self, reason: str, focus: str = "") -> Dict[str, Any]:
+        return {"action": "continue", "reason": reason, "focus": focus}
+
+    def _stop(self, reason: str) -> Dict[str, Any]:
+        return {"action": "stop", "reason": reason, "focus": "Output current best design."}
+
+    def _llm_decide(
+        self,
+        iteration: int,
+        initial_metrics: Dict[str, Any],
+        best_metrics: Dict[str, Any],
+        best_score: float,
+        latest_score: float,
+        target_description: str,
+    ) -> Dict[str, Any]:
+        payload = {
+            "iteration": iteration,
+            "target": target_description or "balanced",
+            "initial_metrics": initial_metrics,
+            "best_metrics": best_metrics,
+            "current_best_score": round(best_score, 6),
+            "latest_iteration_score": round(latest_score, 6),
+            "stagnation_count": self.stagnation_count,
+            "decline_count": self.decline_count,
+        }
+        prompt = (
+            "You are the optimization control agent.\n"
+            "Decide whether the optimization loop should continue based on the "
+            "EDA metrics below.\n"
+            "Return JSON only: {\"action\":\"continue|stop\",\"reason\":\"...\","
+            "\"focus\":\"...\"}\n\n"
+            + json.dumps(payload, ensure_ascii=True, indent=2)
+        )
+        try:
+            raw = self.llm_client.generate(
+                prompt,
+                system_prompt=(
+                    "You decide whether a Verilog optimization loop should "
+                    "continue. Base your decision on objective EDA metrics."
+                ),
+                temperature=0.2,
+                max_new_tokens=160,
+                top_p=0.9,
+                top_k=40,
+                repetition_penalty=1.0,
+            )
+            parsed = _parse_agent_json(raw)
+            if parsed:
+                parsed["raw_model_output"] = raw
+                return parsed
+        except Exception as exc:
+            logger.warning(f"LLM judge failed: {exc}")
+
+        return self._cont("LLM 判断失败，默认继续。")
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 
 
 class RLOptimizer:
-    """LLM + EDA closed-loop optimizer."""
+    """Orchestrates the Planner → Coder → Evaluator → Judge loop."""
 
     def __init__(
         self,
@@ -47,67 +524,93 @@ class RLOptimizer:
         self.model_path = model_path
         self.max_iterations = max_iterations
         self.population_size = population_size
-        self.temperature = temperature
-        self.max_new_tokens = max_new_tokens
         self.rl_mode = rl_mode
-        self.base_temperature = temperature
-        self.base_top_p = base_top_p
-        self.base_top_k = base_top_k
-        self.base_rep_penalty = base_rep_penalty
         self.debug_gen = debug_gen
 
         if debug_dir is None and debug_gen:
             ts = time.strftime("%Y%m%d_%H%M%S")
             debug_root = Path("outputs") / f"debug_{ts}"
             debug_root.mkdir(parents=True, exist_ok=True)
-            self.debug_dir = str(debug_root)
+            self.debug_dir: Optional[str] = str(debug_root)
         else:
             self.debug_dir = debug_dir
 
         self.eda = EDAWrapper()
         self.llm_client = build_llm_client(model_path)
 
-        self.optimization_history: List[Dict[str, Any]] = []
-        self.score_history: List[float] = []
-        self.agent_decisions: List[Dict[str, Any]] = []
+        # Sampling defaults (forwarded to Coder)
+        self._temperature = temperature
+        self._top_p = base_top_p
+        self._top_k = base_top_k
+        self._rep_penalty = base_rep_penalty
+        self._max_new_tokens = max_new_tokens
 
-        self.improvement_streak = 0
-        self.stagnation_count = 0
-        self.decline_count = 0
-        self.exploration_factor = 0.3
-        self.last_best_score = 0.0
-        self.score_trend = 0.0
-        self.module_name: Optional[str] = None
-        self.target_profile = build_target_profile("")
+        logger.info(
+            f"Optimizer initialized — client mode: "
+            f"{getattr(self.llm_client, 'mode', 'unknown')}"
+        )
 
-        logger.info(f"Optimizer initialized with client mode: {getattr(self.llm_client, 'mode', 'unknown')}")
+    # -- main entry ---------------------------------------------------------
 
-    def optimize(self, input_code: str, target_description: str = "", scenario: str = "") -> Dict[str, Any]:
-        self.target_profile = build_target_profile(target_description)
-        self.module_name = self._extract_module_name(input_code)
-        if not self.module_name:
-            return {"success": False, "error": "Unable to extract module name from the input code."}
+    def optimize(
+        self,
+        input_code: str,
+        target_description: str = "",
+        scenario: str = "",
+        progress_callback: ProgressCallback = None,
+    ) -> Dict[str, Any]:
+        target_profile = build_target_profile(target_description)
+        module_name = _extract_module_name(input_code)
+        if not module_name:
+            return {"success": False, "error": "Unable to extract module name from input code."}
 
-        logger.info("Starting optimization loop")
+        weights = target_profile.get("weights", {})
+
+        # ---- Phase 0: initial EDA evaluation ----
+        self._report(progress_callback, phase="initial_eval", message="正在进行初始 EDA 评估…")
         try:
-            initial_data = self.eda.synthesize(input_code, self.module_name, target_freq=100.0)
+            initial_data = self.eda.synthesize(input_code, module_name, target_freq=100.0)
         except Exception as exc:
             return {"success": False, "error": f"Initial synthesis failed: {exc}"}
 
-        if not initial_data.get("syntax_ok", False) or not initial_data.get("synth_ok", False):
+        if not initial_data.get("syntax_ok") or not initial_data.get("synth_ok"):
             return {
                 "success": False,
-                "error": "Input Verilog contains syntax or synthesis errors and cannot be optimized.",
+                "error": "Input Verilog contains syntax or synthesis errors.",
             }
 
-        initial_score = self._calculate_score(initial_data)
+        # ---- Phase 1: Planner ----
+        self._report(progress_callback, phase="planning", message="Planner 正在分析代码结构…")
+        planner = Planner()
+        plan = planner.analyze(input_code, initial_data, target_profile)
+        logger.info(f"Plan: complexity={plan['complexity']}, strategy={plan['strategy']}")
+
+        effective_max = min(self.max_iterations, plan["suggested_max_iterations"])
+
+        # ---- Construct role instances ----
+        evaluator = Evaluator(self.eda)
+        initial_score = evaluator.score(initial_data, weights)
+
+        coder = Coder(
+            llm_client=self.llm_client,
+            target_profile=target_profile,
+            max_new_tokens=self._max_new_tokens,
+            base_temperature=self._temperature,
+            base_top_p=self._top_p,
+            base_top_k=self._top_k,
+            base_rep_penalty=self._rep_penalty,
+            debug_gen=self.debug_gen,
+            debug_dir=self.debug_dir,
+        )
+        judge = Judge(self.llm_client, effective_max)
+
+        # ---- State ----
         best_score = initial_score
         best_code = input_code
         best_metrics = initial_data
-        self.last_best_score = initial_score
-        self.score_history = []
-        self.agent_decisions = []
-        self.optimization_history = [
+        score_history: List[float] = []
+        agent_decisions: List[Dict[str, Any]] = []
+        optimization_history: List[Dict[str, Any]] = [
             {
                 "iteration": 0,
                 "code": input_code,
@@ -117,114 +620,170 @@ class RLOptimizer:
             }
         ]
 
-        for iteration in range(1, self.max_iterations + 1):
-            logger.info(f"Optimization iteration {iteration}/{self.max_iterations}")
+        self._report(
+            progress_callback,
+            phase="planning_done",
+            message=f"计划完成：复杂度={plan['complexity']}，策略={plan['strategy']}，"
+                    f"最大轮次={effective_max}",
+            iteration=0,
+            max_iterations=effective_max,
+            initial_score=initial_score,
+            best_score=initial_score,
+            best_metrics=initial_data,
+            initial_metrics=initial_data,
+            plan_summary={
+                "complexity": plan["complexity"],
+                "strategy": plan["strategy"],
+                "bottlenecks": plan["bottlenecks"],
+            },
+        )
 
+        # ---- Phase 2: Optimization loop ----
+        for iteration in range(1, effective_max + 1):
+            logger.info(f"Iteration {iteration}/{effective_max}")
+
+            # 2a. Planner refines strategy
             if self.rl_mode and iteration > 1:
-                self._update_rl_strategy(best_score)
+                strategy = planner.refine_strategy(
+                    plan, score_history,
+                    judge.stagnation_count, judge.decline_count,
+                )
+                plan["strategy"] = strategy
+                coder.update_sampling(strategy, judge.exploration_factor)
 
-            candidates = self._generate_candidates(
+            self._report(
+                progress_callback,
+                phase="generating",
+                message=f"第 {iteration}/{effective_max} 轮：Coder 正在生成候选方案…",
+                iteration=iteration,
+                max_iterations=effective_max,
+                best_score=best_score,
+                initial_score=initial_score,
+                strategy=plan["strategy"],
+            )
+
+            # 2b. Coder generates
+            candidates = coder.generate_candidates(
                 base_code=best_code,
-                target_description=target_description,
+                plan=plan,
                 iteration=iteration,
                 current_score=best_score,
                 current_metrics=best_metrics,
+                target_description=target_description,
+                population_size=self.population_size,
             )
 
-            iteration_best_score = best_score
-            iteration_best_code = best_code
-            iteration_best_metrics = best_metrics
+            # 2c. Evaluator evaluates
+            iter_best_score = best_score
+            iter_best_code = best_code
+            iter_best_metrics = best_metrics
 
-            for candidate_index, candidate in enumerate(candidates, start=1):
-                module_name = self._detect_top_module(best_code) or "top"
-                if not self._has_complete_module(candidate):
-                    self._maybe_dump_text(iteration, candidate_index, "candidate_incomplete.v", candidate)
+            for ci, candidate in enumerate(candidates, 1):
+                ref_module = _detect_top_module(best_code) or "top"
+
+                if not _has_complete_module(candidate):
                     continue
 
-                candidate_named = self._try_fix_module_name(candidate, module_name)
-                candidate_fixed = self._align_module_header(best_code, candidate_named, module_name)
-                self._maybe_dump_text(iteration, candidate_index, "candidate_fixed.v", candidate_fixed)
+                candidate = _try_fix_module_name(candidate, ref_module)
+                candidate = _align_module_header(best_code, candidate, ref_module)
 
-                metrics_result = self._evaluate_code(candidate_fixed)
-                if not metrics_result.get("success"):
-                    self.optimization_history.append(
-                        {
-                            "iteration": iteration,
-                            "candidate": candidate_index,
-                            "code": candidate_fixed,
-                            "score": None,
-                            "error": metrics_result.get("error", "EDA failed"),
-                            "is_best": False,
-                        }
-                    )
-                    continue
-
-                metrics = metrics_result["data"]
-                score = self._calculate_score(metrics)
-                self.optimization_history.append(
-                    {
-                        "iteration": iteration,
-                        "candidate": candidate_index,
-                        "code": candidate_fixed,
-                        "metrics": metrics,
-                        "score": score,
-                        "is_best": False,
-                    }
+                self._report(
+                    progress_callback,
+                    phase="evaluating",
+                    message=f"第 {iteration}/{effective_max} 轮：Evaluator 评估候选 {ci}…",
+                    iteration=iteration,
+                    max_iterations=effective_max,
+                    best_score=best_score,
+                    initial_score=initial_score,
                 )
 
-                if score > iteration_best_score:
-                    iteration_best_score = score
-                    iteration_best_code = candidate_fixed
-                    iteration_best_metrics = metrics
+                result = evaluator.evaluate(candidate, ref_module)
+                if not result.get("success"):
+                    optimization_history.append({
+                        "iteration": iteration,
+                        "candidate": ci,
+                        "code": candidate,
+                        "score": None,
+                        "error": result.get("error", "EDA failed"),
+                        "is_best": False,
+                    })
+                    continue
+
+                metrics = result["data"]
+                score = evaluator.score(metrics, weights)
+                optimization_history.append({
+                    "iteration": iteration,
+                    "candidate": ci,
+                    "code": candidate,
+                    "metrics": metrics,
+                    "score": score,
+                    "is_best": False,
+                })
+
+                if score > iter_best_score:
+                    iter_best_score = score
+                    iter_best_code = candidate
+                    iter_best_metrics = metrics
                     if self.debug_dir:
-                        best_file = Path(self.debug_dir) / f"best_candidate_iter_{iteration}.v"
-                        best_file.write_text(candidate_fixed, encoding="utf-8")
+                        p = Path(self.debug_dir) / f"best_candidate_iter_{iteration}.v"
+                        p.write_text(candidate, encoding="utf-8")
 
-            self.score_history.append(iteration_best_score)
+            score_history.append(iter_best_score)
 
-            if iteration_best_score > best_score:
-                best_score = iteration_best_score
-                best_code = iteration_best_code
-                best_metrics = iteration_best_metrics
-                self.improvement_streak += 1
-                self.stagnation_count = 0
-            elif abs(iteration_best_score - best_score) < 1e-6:
-                self.improvement_streak = 0
-                self.stagnation_count += 1
-            else:
-                self.improvement_streak = 0
-                self.stagnation_count += 1
-                self.decline_count += 1
+            improved = iter_best_score > best_score
+            declined = iter_best_score < best_score - 1e-6
 
-            decision = self._agent_decide_next_step(
+            if improved:
+                best_score = iter_best_score
+                best_code = iter_best_code
+                best_metrics = iter_best_metrics
+
+            # 2d. Judge decides
+            judge.update_tracking(improved, declined)
+            decision = judge.decide(
                 iteration=iteration,
-                target_description=target_description,
-                current_best_score=best_score,
+                plan=plan,
+                score_history=score_history,
                 initial_metrics=initial_data,
                 best_metrics=best_metrics,
-                latest_iteration_score=iteration_best_score,
+                best_score=best_score,
+                latest_score=iter_best_score,
+                target_description=target_description,
             )
-            self.agent_decisions.append(decision)
-            self.last_best_score = iteration_best_score
+            agent_decisions.append(decision)
+
+            self._report(
+                progress_callback,
+                phase="iteration_done",
+                message=f"第 {iteration}/{effective_max} 轮完成 — "
+                        f"Judge: {decision['action']}（{decision['reason']}）",
+                iteration=iteration,
+                max_iterations=effective_max,
+                best_score=best_score,
+                initial_score=initial_score,
+                latest_score=iter_best_score,
+                decision=decision,
+                best_metrics=best_metrics,
+                initial_metrics=initial_data,
+                agent_decisions=agent_decisions,
+            )
 
             if decision["action"] == "stop":
-                logger.info(f"Agent decided to stop at iteration {iteration}: {decision['reason']}")
+                logger.info(f"Judge stopped at iteration {iteration}: {decision['reason']}")
                 break
 
-        init_score = self._calculate_score(initial_data)
+        # ---- Phase 3: package results ----
         improvement = {
-            "area_improvement": (initial_data["area"] - best_metrics["area"]) / max(1e-9, initial_data["area"]) * 100,
-            "ff_improvement": (
-                (initial_data.get("num_ff", 0) - best_metrics.get("num_ff", 0))
-                / max(1e-9, initial_data.get("num_ff", 0) or 1)
-                * 100
+            "area_improvement": _safe_pct(initial_data["area"], best_metrics["area"]),
+            "ff_improvement": _safe_pct(
+                initial_data.get("num_ff", 0), best_metrics.get("num_ff", 0),
             ),
-            "depth_improvement": (
-                (initial_data.get("logic_depth", 0) - best_metrics.get("logic_depth", 0))
-                / max(1e-9, initial_data.get("logic_depth", 0) or 1)
-                * 100
+            "depth_improvement": _safe_pct(
+                initial_data.get("logic_depth", 0), best_metrics.get("logic_depth", 0),
             ),
-            "score_improvement": (best_score - init_score) / max(1e-9, init_score or 1) * 100,
+            "score_improvement": (
+                (best_score - initial_score) / max(1e-9, abs(initial_score)) * 100
+            ),
         }
 
         result: Dict[str, Any] = {
@@ -234,316 +793,45 @@ class RLOptimizer:
             "original_metrics": initial_data,
             "optimized_metrics": best_metrics,
             "improvement": improvement,
-            "optimization_history": self.optimization_history,
-            "agent_decisions": self.agent_decisions,
-            "total_iterations": len(self.score_history),
-            "total_candidates": max(0, len(self.optimization_history) - 1),
-            "target_profile": self.target_profile,
+            "optimization_history": optimization_history,
+            "agent_decisions": agent_decisions,
+            "total_iterations": len(score_history),
+            "total_candidates": max(0, len(optimization_history) - 1),
+            "target_profile": target_profile,
             "llm_mode": getattr(self.llm_client, "mode", "unknown"),
         }
-
         result["ai_insights"] = generate_ai_insights(
             original_code=input_code,
             optimized_code=best_code,
             original_metrics=initial_data,
             optimized_metrics=best_metrics,
-            profile=self.target_profile,
+            profile=target_profile,
             target_description=target_description,
             scenario=scenario,
         )
         result["competition_package"] = generate_competition_package(
             result=result,
-            profile=self.target_profile,
+            profile=target_profile,
             target_description=target_description,
             scenario=scenario,
         )
         return result
 
-    def _update_rl_strategy(self, current_best_score: float) -> None:
-        recent_scores = self.score_history[-5:]
-        short_trend = 0.0
-        long_trend = 0.0
-        if len(recent_scores) >= 2:
-            short_trend = (recent_scores[-1] - recent_scores[-2]) / max(abs(recent_scores[-2]), 1e-6)
-        if len(recent_scores) >= 3:
-            long_trend = (recent_scores[-1] - recent_scores[0]) / max(abs(recent_scores[0]), 1e-6)
-        self.score_trend = short_trend
+    # -- helpers ------------------------------------------------------------
 
-        if short_trend < -0.01:
-            self.decline_count += 1
-        else:
-            self.decline_count = 0
-
-        if self.decline_count >= 2:
-            self.exploration_factor = min(0.9, self.exploration_factor + 0.15)
-            self.temperature = min(1.3, self.base_temperature + 0.3)
-        elif self.stagnation_count >= 2:
-            self.exploration_factor = min(0.7, self.exploration_factor + 0.1)
-            self.temperature = min(1.1, self.base_temperature + 0.2)
-        elif self.improvement_streak >= 3:
-            self.exploration_factor = max(0.1, self.exploration_factor - 0.05)
-            self.temperature = max(0.6, self.base_temperature - 0.1)
-        elif short_trend > 0.02:
-            self.exploration_factor = max(0.2, self.exploration_factor - 0.03)
-            self.temperature = max(0.7, self.base_temperature - 0.05)
-        else:
-            self.exploration_factor += (0.3 - self.exploration_factor) * 0.3
-            self.temperature += (self.base_temperature - self.temperature) * 0.2
-
-        logger.info(
-            f"Strategy updated: temperature={self.temperature:.2f}, exploration={self.exploration_factor:.2f}, "
-            f"short_trend={short_trend:.4f}, long_trend={long_trend:.4f}, score={current_best_score:.4f}"
-        )
-
-    def _generate_candidates(
-        self,
-        base_code: str,
-        target_description: str,
-        iteration: int,
-        current_score: float = 0,
-        current_metrics: Optional[Dict[str, Any]] = None,
-    ) -> List[str]:
-        constraints = self._build_dynamic_constraints(iteration, current_score, current_metrics or {})
-        profile_hint = self.target_profile.get("prompt_focus", "")
-        if target_description:
-            prompt = (
-                f"请优化以下 Verilog 代码，目标是：{target_description}。"
-                f"{profile_hint} {constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
-            )
-        else:
-            prompt = (
-                f"请优化以下 Verilog 代码，使其在资源和时序上更优。"
-                f"{profile_hint} {constraints}\n\n原始代码：\n{base_code}\n\n优化后的代码："
-            )
-
-        candidates: List[str] = []
-        for i in range(self.population_size):
+    @staticmethod
+    def _report(cb: ProgressCallback, **kwargs: Any) -> None:
+        if cb is not None:
             try:
-                candidate = self._generate_single_candidate(prompt, iteration, i + 1, current_score, current_metrics or {})
-                if not candidate:
-                    continue
-                if self._is_meaningfully_different(base_code, candidate):
-                    candidates.append(candidate)
-                elif self.rl_mode and (self.stagnation_count >= 2 or self.decline_count >= 1):
-                    candidates.append(candidate)
-            except Exception as exc:
-                logger.warning(f"Candidate generation failed for #{i + 1}: {exc}")
-        logger.info(f"Generated {len(candidates)} valid candidates")
-        return candidates
+                cb(kwargs)
+            except Exception:
+                pass
 
-    def _build_dynamic_constraints(self, iteration: int, current_score: float, current_metrics: Dict[str, Any]) -> str:
-        base_constraints = (
-            "要求：1) 必须严格保持顶层模块名、端口列表、位宽和方向一致；"
-            "2) 只修改模块内部实现，不改变功能语义；"
-            "3) 仅输出完整 Verilog 代码，不要输出解释。"
-        )
-        if not self.rl_mode or not current_metrics:
-            return base_constraints
-
-        hints: List[str] = []
-        if self.exploration_factor > 0.5:
-            hints.append("4) 可以尝试更激进的逻辑重构、资源共享或关键路径重写；")
-        else:
-            hints.append("4) 优先做保守优化，例如常量折叠、冗余消除和表达式简化；")
-
-        area = current_metrics.get("area", 0)
-        ff_count = current_metrics.get("num_ff", 0)
-        depth = current_metrics.get("logic_depth", 0)
-
-        if self.decline_count >= 2:
-            hints.append("5) 当前方向效果不佳，请尝试与前几轮显著不同的实现思路；")
-        elif area > ff_count * 100:
-            hints.append("5) 当前面积是主要瓶颈，请优先减少重复逻辑和中间信号。")
-        elif ff_count > 10:
-            hints.append("5) 当前寄存器数量偏多，请优先考虑寄存器复用和状态压缩。")
-        elif depth > 20:
-            hints.append("5) 当前逻辑深度偏高，请优先缩短关键路径。")
-        else:
-            hints.append(f"5) 当前得分为 {current_score:.4f}，请做小步但有效的结构优化。")
-
-        hints.append(f"6) 当前为第 {iteration} 轮优化。")
-        return base_constraints + "".join(hints)
-
-    def _generate_single_candidate(
-        self,
-        prompt: str,
-        iteration: int,
-        cand_idx: int,
-        current_score: float = 0,
-        current_metrics: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        dynamic_top_p = max(0.7, min(0.95, self.base_top_p + (self.exploration_factor - 0.3) * 0.2))
-        dynamic_top_k = max(30, min(80, int(self.base_top_k + (self.exploration_factor - 0.3) * 50)))
-        dynamic_rep_penalty = max(1.0, min(1.15, self.base_rep_penalty + (self.exploration_factor - 0.3) * 0.1))
-
-        generated_tail = self.llm_client.generate(
-            prompt,
-            system_prompt="你是面向 Verilog 代码优化任务的 AI Agent，需要结合外部 EDA 指标持续改进代码。",
-            temperature=self.temperature,
-            max_new_tokens=self.max_new_tokens,
-            top_p=dynamic_top_p,
-            top_k=dynamic_top_k,
-            repetition_penalty=dynamic_rep_penalty,
-        )
-        if not generated_tail:
-            return None
-
-        self._maybe_dump_text(iteration, cand_idx, "generated_tail.txt", generated_tail)
-        self._maybe_dump_text(iteration, cand_idx, "prompt.txt", prompt)
-
-        method = "raw"
-        if "```" in generated_tail:
-            method = "fenced"
-        elif ("module" in generated_tail) and ("endmodule" in generated_tail):
-            method = "module"
-
-        code_part = self._extract_code_block(generated_tail).strip()
-        self._maybe_dump_text(iteration, cand_idx, f"extracted_{method}.v", code_part)
-
-        if not code_part and "优化后的代码" in generated_tail:
-            code_part = generated_tail.split("优化后的代码")[-1].strip(":： \n")
-
-        return code_part.strip() or None
-
-    def _evaluate_code(self, code: str) -> Dict[str, Any]:
-        module = self._detect_top_module(code) or "top"
-        return analyze_verilog_api(code, module)
-
-    def _calculate_score(self, metrics: Dict[str, Any]) -> float:
-        weights = self.target_profile.get("weights", {})
-        area_weight = float(weights.get("area", 0.45))
-        ff_weight = float(weights.get("ff", 0.35))
-        depth_weight = float(weights.get("depth", 0.20))
-        pass_bonus_weight = float(weights.get("pass_bonus", 0.10))
-
-        pass_bonus = 0.0
-        if metrics.get("syntax_ok"):
-            pass_bonus += 1.0
-        if metrics.get("synth_ok"):
-            pass_bonus += 1.0
-        if metrics.get("equiv_ok"):
-            pass_bonus += 1.0
-
-        area = max(0.0, float(metrics.get("area", 0)))
-        ff = max(0.0, float(metrics.get("num_ff", 0)))
-        depth = max(0.0, float(metrics.get("logic_depth", 0)))
-
-        area_score = 1.0 / (1.0 + area / 1000.0)
-        ff_score = 1.0 / (1.0 + ff / 1000.0)
-        depth_score = 1.0 / (1.0 + depth / 10.0)
-
-        return (
-            area_weight * area_score
-            + ff_weight * ff_score
-            + depth_weight * depth_score
-            + pass_bonus_weight * pass_bonus
-        )
-
-    def _agent_decide_next_step(
-        self,
-        iteration: int,
-        target_description: str,
-        current_best_score: float,
-        initial_metrics: Dict[str, Any],
-        best_metrics: Dict[str, Any],
-        latest_iteration_score: float,
-    ) -> Dict[str, Any]:
-        target_text = target_description or self.target_profile.get("name", "balanced")
-        payload = {
-            "iteration": iteration,
-            "target": target_text,
-            "initial_metrics": initial_metrics,
-            "best_metrics": best_metrics,
-            "current_best_score": round(current_best_score, 6),
-            "latest_iteration_score": round(latest_iteration_score, 6),
-            "stagnation_count": self.stagnation_count,
-            "decline_count": self.decline_count,
-            "improvement_streak": self.improvement_streak,
-        }
-
-        prompt = (
-            "You are the optimization control agent.\n"
-            "Decide whether the optimization loop should continue based on the EDA metrics below.\n"
-            "Return JSON only in this format:\n"
-            "{\"action\":\"continue|stop\",\"reason\":\"...\",\"focus\":\"...\"}\n\n"
-            f"{json.dumps(payload, ensure_ascii=True, indent=2)}"
-        )
-
-        fallback = self._heuristic_agent_decision(payload)
-        try:
-            raw_text = self.llm_client.generate(
-                prompt,
-                system_prompt=(
-                    "You decide whether a Verilog optimization loop should continue. "
-                    "Your decision must be based on objective EDA metrics only."
-                ),
-                temperature=0.2,
-                max_new_tokens=160,
-                top_p=0.9,
-                top_k=40,
-                repetition_penalty=1.0,
-            )
-            parsed = self._parse_agent_json(raw_text)
-            if parsed is None:
-                parsed = fallback
-                parsed["reason"] = f"{fallback['reason']} 模型原始输出解析失败。"
-                parsed["raw_model_output"] = raw_text
-            else:
-                parsed["raw_model_output"] = raw_text
-            return parsed
-        except Exception as exc:
-            fallback["reason"] = f"{fallback['reason']} Agent decision fallback due to error: {exc}"
-            return fallback
-
-    def _heuristic_agent_decision(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        area_improved = payload["initial_metrics"].get("area", 0) - payload["best_metrics"].get("area", 0)
-        depth_improved = payload["initial_metrics"].get("logic_depth", 0) - payload["best_metrics"].get("logic_depth", 0)
-
-        if payload["stagnation_count"] >= 3:
-            return {
-                "action": "stop",
-                "reason": "Multiple stagnant rounds detected.",
-                "focus": "Summarize current best design and stop.",
-            }
-        if payload["iteration"] >= self.max_iterations:
-            return {
-                "action": "stop",
-                "reason": "Maximum iteration budget reached.",
-                "focus": "Output current best design.",
-            }
-        if area_improved <= 0 and depth_improved <= 0 and payload["iteration"] >= 2:
-            return {
-                "action": "continue",
-                "reason": "No clear metric gain yet, continue searching with a different strategy.",
-                "focus": "Increase exploration and change rewrite style.",
-            }
-        return {
-            "action": "continue",
-            "reason": "Current direction still has optimization potential.",
-            "focus": "Preserve improved structure and continue refining.",
-        }
-
-    def _parse_agent_json(self, raw_text: str) -> Optional[Dict[str, Any]]:
-        if not raw_text:
-            return None
-        text = raw_text.strip()
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict) and data.get("action") in {"continue", "stop"}:
-                return data
-        except Exception:
-            pass
-
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict) and data.get("action") in {"continue", "stop"}:
-                return data
-        except Exception:
-            return None
-        return None
+    def cleanup(self) -> None:
+        if hasattr(self, "eda"):
+            self.eda.cleanup()
+        if hasattr(self, "llm_client"):
+            self.llm_client.cleanup()
 
     def save_optimization_report(self, result: Dict[str, Any], output_path: str) -> None:
         report = {
@@ -552,158 +840,155 @@ class RLOptimizer:
             "optimization_config": {
                 "max_iterations": self.max_iterations,
                 "population_size": self.population_size,
-                "temperature": self.temperature,
                 "llm_mode": getattr(self.llm_client, "mode", "unknown"),
             },
             "result": result,
         }
-        with open(output_path, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, ensure_ascii=False)
+        Path(output_path).write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
         logger.info(f"Optimization report saved to {output_path}")
 
-    def cleanup(self) -> None:
-        if hasattr(self, "eda"):
-            self.eda.cleanup()
-        if hasattr(self, "llm_client"):
-            self.llm_client.cleanup()
 
-    def _has_complete_module(self, text: str) -> bool:
-        return ("module" in text) and ("endmodule" in text)
+# ---------------------------------------------------------------------------
+# Shared utilities (module-level)
+# ---------------------------------------------------------------------------
 
-    def _try_fix_module_name(self, code: str, module_name: str) -> str:
-        pattern = re.compile(
-            r"(\bmodule\s+)([A-Za-z_][A-Za-z0-9_]*)(\s*(?:#\s*\([\s\S]*?\))?\s*\()",
-            flags=re.IGNORECASE,
-        )
+def _extract_module_name(code: str) -> Optional[str]:
+    m = re.search(r"\bmodule\s+(\w+)", code, re.IGNORECASE)
+    return m.group(1) if m else None
 
-        def repl(match: re.Match[str]) -> str:
-            return f"{match.group(1)}{module_name}{match.group(3)}"
 
-        return pattern.sub(repl, code, count=1)
-
-    def _extract_module_name(self, code: str) -> Optional[str]:
-        match = re.search(r"\bmodule\s+(\w+)", code, re.IGNORECASE)
-        if match:
-            return match.group(1)
+def _detect_top_module(code: str) -> Optional[str]:
+    text = re.sub(r"/\*[\s\S]*?\*/", "", code)
+    text = re.sub(r"//.*", "", text)
+    names = re.findall(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+    if not names:
         return None
+    for n in names:
+        if n.lower() == "top":
+            return n
+    return names[0]
 
-    def _extract_module_ports(self, code: str, module_name: str) -> Optional[str]:
-        pattern = re.compile(
-            rf"\bmodule\s+{re.escape(module_name)}\s*(?:#\s*\([\s\S]*?\))?\s*\(([\s\S]*?)\)\s*;",
-            flags=re.IGNORECASE,
-        )
-        match = pattern.search(code)
-        if match:
-            return match.group(1)
+
+def _has_complete_module(text: str) -> bool:
+    return "module" in text and "endmodule" in text
+
+
+def _try_fix_module_name(code: str, module_name: str) -> str:
+    pat = re.compile(
+        r"(\bmodule\s+)([A-Za-z_][A-Za-z0-9_]*)(\s*(?:#\s*\([\s\S]*?\))?\s*\()",
+        re.IGNORECASE,
+    )
+    return pat.sub(lambda m: f"{m.group(1)}{module_name}{m.group(3)}", code, count=1)
+
+
+def _extract_module_ports(code: str, module_name: str) -> Optional[str]:
+    pat = re.compile(
+        rf"\bmodule\s+{re.escape(module_name)}\s*(?:#\s*\([\s\S]*?\))?\s*\(([\s\S]*?)\)\s*;",
+        re.IGNORECASE,
+    )
+    m = pat.search(code)
+    return m.group(1) if m else None
+
+
+def _extract_module_params(code: str, module_name: str) -> Optional[str]:
+    pat = re.compile(
+        rf"\bmodule\s+{re.escape(module_name)}\s*(#\s*\([\s\S]*?\))\s*\(",
+        re.IGNORECASE,
+    )
+    m = pat.search(code)
+    return m.group(1) if m else None
+
+
+def _align_module_header(base_code: str, cand_code: str, module_name: str) -> str:
+    base_ports = _extract_module_ports(base_code, module_name)
+    base_params = _extract_module_params(base_code, module_name)
+    if not base_ports:
+        return cand_code
+
+    pat = re.compile(
+        rf"(\bmodule\s+{re.escape(module_name)}\s*)(#\s*\([\s\S]*?\))?\s*\([\s\S]*?\)(\s*;)",
+        re.IGNORECASE,
+    )
+
+    def repl(m: re.Match) -> str:
+        prefix = m.group(1)
+        params = base_params if base_params is not None else (m.group(2) or "")
+        suffix = m.group(3)
+        return f"{prefix}{params}({base_ports}){suffix}"
+
+    return pat.sub(repl, cand_code, count=1)
+
+
+def _extract_code_block(text: str) -> str:
+    fenced = list(
+        re.finditer(r"```(?:verilog|systemverilog)?\s*\n([\s\S]*?)\n```", text, re.IGNORECASE),
+    )
+    if fenced:
+        return fenced[-1].group(1).strip()
+    module_match = re.search(r"\bmodule\b[\s\S]*?\bendmodule\b", text, re.IGNORECASE)
+    if module_match:
+        return module_match.group(0).strip()
+    return text.strip()
+
+
+def _normalize_code(code: str) -> str:
+    code = re.sub(r"//.*", "", code)
+    code = re.sub(r"/\*[\s\S]*?\*/", "", code)
+    return re.sub(r"\s+", " ", code).strip()
+
+
+def _parse_agent_json(raw: str) -> Optional[Dict[str, Any]]:
+    if not raw:
         return None
-
-    def _extract_module_params(self, code: str, module_name: str) -> Optional[str]:
-        pattern = re.compile(
-            rf"\bmodule\s+{re.escape(module_name)}\s*(#\s*\([\s\S]*?\))\s*\(",
-            flags=re.IGNORECASE,
-        )
-        match = pattern.search(code)
-        if match:
-            return match.group(1)
-        return None
-
-    def _align_module_header(self, base_code: str, cand_code: str, module_name: str) -> str:
-        base_ports = self._extract_module_ports(base_code, module_name)
-        base_params = self._extract_module_params(base_code, module_name)
-        if not base_ports:
-            return cand_code
-
-        pattern = re.compile(
-            rf"(\bmodule\s+{re.escape(module_name)}\s*)(#\s*\([\s\S]*?\))?\s*\([\s\S]*?\)(\s*;)",
-            flags=re.IGNORECASE,
-        )
-
-        def repl(match: re.Match[str]) -> str:
-            prefix = match.group(1)
-            params = base_params if base_params is not None else (match.group(2) or "")
-            suffix = match.group(3)
-            return f"{prefix}{params}({base_ports}){suffix}"
-
-        return pattern.sub(repl, cand_code, count=1)
-
-    def _candidate_dir(self, iteration: int, cand_idx: int) -> Optional[str]:
-        if not self.debug_gen or not self.debug_dir:
-            return None
-        path = Path(self.debug_dir) / f"iter_{iteration:02d}" / f"cand_{cand_idx:02d}"
-        path.mkdir(parents=True, exist_ok=True)
-        return str(path)
-
-    def _maybe_dump_text(self, iteration: int, cand_idx: int, name: str, content: str) -> None:
+    text = raw.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("action") in ("continue", "stop"):
+            return data
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
         try:
-            directory = self._candidate_dir(iteration, cand_idx)
-            if not directory:
-                return
-            file_path = Path(directory) / name
-            file_path.write_text(content or "", encoding="utf-8")
+            data = json.loads(m.group(0))
+            if isinstance(data, dict) and data.get("action") in ("continue", "stop"):
+                return data
         except Exception:
-            return
+            pass
+    return None
 
-    def _detect_top_module(self, code: str) -> Optional[str]:
-        try:
-            text = re.sub(r"/\*[\s\S]*?\*/", "", code)
-            text = re.sub(r"//.*", "", text)
-            names = re.findall(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_]*)", text)
-            if not names:
-                return None
-            for name in names:
-                if name.lower() == "top":
-                    return name
-            return names[0]
-        except Exception:
-            return None
 
-    def _extract_code_block(self, text: str) -> str:
-        fence_matches = list(
-            re.finditer(r"```(?:verilog|systemverilog)?\s*\n([\s\S]*?)\n```", text, flags=re.IGNORECASE)
-        )
-        if fence_matches:
-            return fence_matches[-1].group(1).strip()
+def _safe_pct(old: Any, new: Any) -> float:
+    old_f = float(old or 0)
+    new_f = float(new or 0)
+    if abs(old_f) < 1e-9:
+        return 0.0
+    return (old_f - new_f) / abs(old_f) * 100
 
-        module_match = re.search(r"\bmodule\b[\s\S]*?\bendmodule\b", text, flags=re.IGNORECASE)
-        if module_match:
-            return module_match.group(0).strip()
-        return text.strip()
 
-    def _normalize_code(self, code: str) -> str:
-        code = re.sub(r"//.*", "", code)
-        code = re.sub(r"/\*[\s\S]*?\*/", "", code)
-        code = re.sub(r"\s+", " ", code).strip()
-        return code
-
-    def _is_meaningfully_different(self, base: str, cand: str, threshold: float = 0.98) -> bool:
-        base_norm = self._normalize_code(base)
-        cand_norm = self._normalize_code(cand)
-        if not cand_norm:
-            return False
-        if base_norm == cand_norm:
-            return False
-        similarity = SequenceMatcher(a=base_norm, b=cand_norm).ratio()
-        return similarity < threshold
-
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Agent-driven Verilog optimizer")
-    parser.add_argument("--model", required=True, help="Path to local model or adapter directory")
+    parser.add_argument("--model", required=True, help="Model or adapter path")
     parser.add_argument("--input", "-i", help="Input Verilog file")
     parser.add_argument("--code", "-c", help="Inline Verilog code")
-    parser.add_argument("--target", "-t", default="", help="Optimization target description")
-    parser.add_argument("--scenario", default="", help="Competition scenario description")
-    parser.add_argument("--iterations", type=int, default=10, help="Maximum optimization iterations")
-    parser.add_argument("--population", type=int, default=5, help="Candidate count per iteration")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Generation temperature")
+    parser.add_argument("--target", "-t", default="", help="Optimization target")
+    parser.add_argument("--scenario", default="", help="Application scenario")
+    parser.add_argument("--iterations", type=int, default=10, help="Max iterations")
+    parser.add_argument("--population", type=int, default=5, help="Candidates per iter")
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--output", "-o", help="Output directory")
     args = parser.parse_args()
 
     if args.input:
-        with open(args.input, "r", encoding="utf-8") as handle:
-            input_code = handle.read()
+        input_code = Path(args.input).read_text(encoding="utf-8")
     elif args.code:
         input_code = args.code
     else:
@@ -726,15 +1011,17 @@ def main() -> None:
             print(f"Depth improvement: {result['improvement']['depth_improvement']:.2f}%")
             print(f"Score improvement: {result['improvement']['score_improvement']:.2f}%")
             if args.output:
-                output_dir = Path(args.output)
-                output_dir.mkdir(exist_ok=True)
-                (output_dir / "optimized_code.v").write_text(result["optimized_code"], encoding="utf-8")
-                optimizer.save_optimization_report(result, str(output_dir / "optimization_report.json"))
-                if result.get("competition_package", {}).get("markdown_report"):
-                    (output_dir / "competition_summary.md").write_text(
-                        result["competition_package"]["markdown_report"],
-                        encoding="utf-8",
-                    )
+                out = Path(args.output)
+                out.mkdir(exist_ok=True)
+                (out / "optimized_code.v").write_text(
+                    result["optimized_code"], encoding="utf-8",
+                )
+                optimizer.save_optimization_report(
+                    result, str(out / "optimization_report.json"),
+                )
+                md = result.get("competition_package", {}).get("markdown_report")
+                if md:
+                    (out / "competition_summary.md").write_text(md, encoding="utf-8")
                 print(f"Saved to: {args.output}")
         else:
             print(f"Optimization failed: {result['error']}")

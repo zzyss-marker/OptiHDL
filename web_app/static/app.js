@@ -153,8 +153,231 @@ function renderAgentDecisions(result) {
 
     agentOutput.textContent = decisions.map((decision, index) => {
         const focus = decision.focus ? `\nfocus: ${decision.focus}` : "";
-        return `round ${index + 1}\naction: ${decision.action}\nreason: ${decision.reason}${focus}`;
+        return `[Judge] round ${index + 1}\naction: ${decision.action}\nreason: ${decision.reason}${focus}`;
     }).join("\n\n");
+}
+
+function renderProgress(progress) {
+    if (!progress) return;
+
+    // Drive pipeline visualization
+    updatePipeline(progress);
+
+    const phase = progress.phase || "";
+    const iter = progress.iteration || 0;
+    const maxIter = progress.max_iterations || "?";
+    const bestScore = progress.best_score;
+    const initScore = progress.initial_score;
+    const message = progress.message || "";
+    const strategy = progress.strategy || "";
+
+    // Update status bar with detailed progress
+    if (iter > 0) {
+        let scoreInfo = "";
+        if (bestScore !== undefined && initScore !== undefined) {
+            const delta = ((bestScore - initScore) / Math.max(1e-9, Math.abs(initScore)) * 100).toFixed(2);
+            scoreInfo = `  |  得分 ${bestScore.toFixed(4)} (${delta >= 0 ? "+" : ""}${delta}%)`;
+        }
+        const strategyInfo = strategy ? `  |  策略: ${strategy}` : "";
+        setStatus(`优化中: ${iter}/${maxIter} 轮${scoreInfo}${strategyInfo}`, "info");
+    } else if (message) {
+        setStatus(message, "info");
+    }
+
+    // Show plan summary when available
+    if (progress.plan_summary) {
+        const ps = progress.plan_summary;
+        addLogEntry(
+            `[Planner] 复杂度=${ps.complexity}, 策略=${ps.strategy}, 瓶颈=${(ps.bottlenecks || []).join("/")}`,
+            "info"
+        );
+    }
+
+    // Log iteration phase messages
+    if (phase === "generating" && iter > 0) {
+        addLogEntry(`[Coder] 第 ${iter} 轮生成候选方案… (策略: ${strategy || "balanced"})`, "info");
+    }
+
+    // Show decisions incrementally
+    if (phase === "iteration_done") {
+        const decision = progress.decision;
+        if (decision) {
+            const tag = decision.action === "stop" ? "warning" : "success";
+            addLogEntry(
+                `[Judge] 第 ${iter} 轮: ${decision.action} — ${decision.reason}`,
+                tag
+            );
+        }
+
+        // Update agent output panel with all decisions so far
+        const decisions = progress.agent_decisions || [];
+        if (decisions.length) {
+            agentOutput.textContent = decisions.map((d, i) => {
+                const focus = d.focus ? `\nfocus: ${d.focus}` : "";
+                return `[Judge] round ${i + 1}\naction: ${d.action}\nreason: ${d.reason}${focus}`;
+            }).join("\n\n");
+        }
+
+        // Update metrics table with current best vs initial
+        if (progress.best_metrics && progress.initial_metrics) {
+            renderMetrics({
+                original_metrics: progress.initial_metrics,
+                optimized_metrics: progress.best_metrics,
+                improvement: {
+                    area_improvement: safePct(progress.initial_metrics.area, progress.best_metrics.area),
+                    ff_improvement: safePct(progress.initial_metrics.num_ff, progress.best_metrics.num_ff),
+                    depth_improvement: safePct(progress.initial_metrics.logic_depth, progress.best_metrics.logic_depth),
+                    score_improvement: bestScore !== undefined && initScore !== undefined
+                        ? ((bestScore - initScore) / Math.max(1e-9, Math.abs(initScore)) * 100)
+                        : 0,
+                },
+            });
+        }
+    }
+}
+
+function safePct(oldVal, newVal) {
+    const o = parseFloat(oldVal || 0);
+    const n = parseFloat(newVal || 0);
+    if (Math.abs(o) < 1e-9) return 0;
+    return (o - n) / Math.abs(o) * 100;
+}
+
+/* ─── Pipeline visualization ─── */
+const pipelineNodes = {
+    planner:   document.getElementById("node-planner"),
+    coder:     document.getElementById("node-coder"),
+    evaluator: document.getElementById("node-evaluator"),
+    judge:     document.getElementById("node-judge"),
+};
+const pipelineStatus = {
+    planner:   document.getElementById("st-planner"),
+    coder:     document.getElementById("st-coder"),
+    evaluator: document.getElementById("st-evaluator"),
+    judge:     document.getElementById("st-judge"),
+};
+const pipes = {
+    pc: document.getElementById("pipe-pc"),
+    ce: document.getElementById("pipe-ce"),
+    ej: document.getElementById("pipe-ej"),
+};
+const feedbackArc  = document.getElementById("feedback-arc");
+const feedbackText = document.getElementById("feedback-text");
+let lastPipelinePhase = "";
+
+function resetPipeline() {
+    Object.values(pipelineNodes).forEach(n => n.classList.remove("active", "done"));
+    Object.values(pipes).forEach(p => p.classList.remove("active"));
+    Object.values(pipelineStatus).forEach(s => { s.textContent = "idle"; });
+    feedbackArc.classList.remove("active");
+    feedbackText.textContent = "";
+    lastPipelinePhase = "";
+}
+
+function setPipelineActive(role) {
+    // Clear active from all, keep done
+    Object.values(pipelineNodes).forEach(n => n.classList.remove("active"));
+    Object.values(pipes).forEach(p => p.classList.remove("active"));
+    if (pipelineNodes[role]) {
+        pipelineNodes[role].classList.add("active");
+    }
+}
+
+function setPipelineDone(role) {
+    if (pipelineNodes[role]) {
+        pipelineNodes[role].classList.remove("active");
+        pipelineNodes[role].classList.add("done");
+    }
+}
+
+function setNodeStatus(role, text) {
+    if (pipelineStatus[role]) {
+        pipelineStatus[role].textContent = text;
+    }
+}
+
+function updatePipeline(progress) {
+    if (!progress) return;
+    const phase = progress.phase || "";
+
+    // Avoid re-processing the exact same progress object
+    const phaseKey = `${phase}_${progress.iteration || 0}`;
+    if (phaseKey === lastPipelinePhase) return;
+    lastPipelinePhase = phaseKey;
+
+    const iter = progress.iteration || 0;
+    const maxIter = progress.max_iterations || "?";
+
+    switch (phase) {
+        case "initial_eval":
+            resetPipeline();
+            setPipelineActive("evaluator");
+            setNodeStatus("evaluator", "initial EDA...");
+            break;
+
+        case "planning":
+            setPipelineDone("evaluator");
+            setNodeStatus("evaluator", "done");
+            setPipelineActive("planner");
+            setNodeStatus("planner", "analyzing...");
+            break;
+
+        case "planning_done": {
+            setPipelineDone("planner");
+            const ps = progress.plan_summary || {};
+            setNodeStatus("planner", ps.strategy || "done");
+            break;
+        }
+
+        case "generating":
+            // Planner done, Coder active
+            setPipelineDone("planner");
+            setPipelineActive("coder");
+            pipes.pc.classList.add("active");
+            setNodeStatus("coder", `iter ${iter}/${maxIter}`);
+            // Show feedback loop from iteration 2 onward
+            if (iter >= 2) {
+                feedbackArc.classList.add("active");
+                feedbackText.textContent = `iteration ${iter}`;
+            }
+            break;
+
+        case "evaluating":
+            setPipelineDone("coder");
+            setNodeStatus("coder", "done");
+            setPipelineActive("evaluator");
+            pipes.ce.classList.add("active");
+            setNodeStatus("evaluator", "EDA running...");
+            break;
+
+        case "iteration_done": {
+            setPipelineDone("evaluator");
+            setNodeStatus("evaluator", "done");
+            setPipelineActive("judge");
+            pipes.ej.classList.add("active");
+            const decision = progress.decision || {};
+            const action = decision.action || "?";
+            setNodeStatus("judge", action);
+
+            if (action === "stop") {
+                // Final state — mark judge done, update feedback text
+                setTimeout(() => {
+                    setPipelineDone("judge");
+                    setNodeStatus("judge", "stopped");
+                    feedbackText.textContent = `${iter} rounds, stopped`;
+                    Object.values(pipes).forEach(p => p.classList.remove("active"));
+                }, 600);
+            } else {
+                // Continue — briefly show judge active, then loop back
+                feedbackArc.classList.add("active");
+                feedbackText.textContent = `iteration ${iter} done`;
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
 }
 
 async function parseApiResponse(response) {
@@ -235,8 +458,18 @@ function updateOptimizationResult(result) {
     if (!result.success) {
         setStatus(result.error || "优化失败", "error");
         addLogEntry(`优化失败: ${result.error || "未知错误"}`, "error");
+        resetPipeline();
         return;
     }
+
+    // Mark all pipeline nodes as done
+    Object.values(pipelineNodes).forEach(n => { n.classList.remove("active"); n.classList.add("done"); });
+    Object.values(pipes).forEach(p => p.classList.remove("active"));
+    setNodeStatus("planner", "done");
+    setNodeStatus("coder", "done");
+    setNodeStatus("evaluator", "done");
+    setNodeStatus("judge", "done");
+    feedbackText.textContent = `${result.total_iterations || "?"} rounds, completed`;
 
     originalCode.textContent = result.original_code || "--";
     originalCode.classList.add("collapsed");
@@ -263,6 +496,7 @@ async function optimizeCode() {
     setStatus("Agent 正在优化，请稍候...", "info");
     addLogEntry("开始 Agent 优化任务", "info");
     btnOptimize.disabled = true;
+    resetPipeline();
 
     try {
         const response = await fetch("/api/optimize_async", {
@@ -271,9 +505,10 @@ async function optimizeCode() {
             body: JSON.stringify({ code, target, scenario }),
         });
         const startPayload = await parseApiResponse(response);
+        addLogEntry("优化任务已提交，等待 Agent 启动…", "info");
         const result = await waitForJob(startPayload.job_id, {
             onProgress(job) {
-                setStatus(`Agent 正在优化... ${job.status}`, "info");
+                renderProgress(job.progress);
             },
         });
         updateOptimizationResult(result);

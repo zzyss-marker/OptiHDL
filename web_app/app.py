@@ -78,7 +78,7 @@ class OptimizationManager:
             apply_runtime_settings(runtime_settings)
             self._optimizer = RLOptimizer(
                 model_path=model_path,
-                max_iterations=5,
+                max_iterations=10,
                 population_size=1,
                 temperature=0.8,
                 max_new_tokens=1024,
@@ -89,10 +89,11 @@ class OptimizationManager:
             self._config_signature = config_signature
         return self._optimizer
 
-    def optimize(self, code: str, target: str, scenario: str, model_path: str, runtime_settings: dict):
+    def optimize(self, code: str, target: str, scenario: str, model_path: str,
+                 runtime_settings: dict, progress_callback=None):
         try:
             optimizer = self.ensure_optimizer(model_path, runtime_settings)
-            return optimizer.optimize(code, target, scenario)
+            return optimizer.optimize(code, target, scenario, progress_callback=progress_callback)
         except Exception as exc:
             log.exception("[Manager] optimization failed")
             return {"success": False, "error": str(exc)}
@@ -242,15 +243,41 @@ def create_app() -> Flask:
             return jsonify({"success": False, "error": "Please input Verilog code to optimize"}), 400
 
         model_path = get_default_model_path(runtime_settings)
-        job_id = start_job(
-            "optimize",
-            manager.optimize,
-            code,
-            target,
-            scenario,
-            model_path,
-            runtime_settings,
-        )
+
+        job_id = uuid.uuid4().hex
+        jobs[job_id] = {
+            "id": job_id,
+            "type": "optimize",
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": None,
+            "progress": None,
+        }
+
+        def on_progress(data):
+            jobs[job_id]["progress"] = data
+            jobs[job_id]["updated_at"] = time.time()
+
+        def runner():
+            jobs[job_id]["status"] = "running"
+            jobs[job_id]["updated_at"] = time.time()
+            try:
+                result = manager.optimize(
+                    code, target, scenario, model_path, runtime_settings,
+                    progress_callback=on_progress,
+                )
+                jobs[job_id]["result"] = result
+                jobs[job_id]["status"] = "completed"
+            except Exception as exc:
+                log.exception(f"[Job] optimize failed")
+                jobs[job_id]["error"] = str(exc)
+                jobs[job_id]["status"] = "failed"
+            finally:
+                jobs[job_id]["updated_at"] = time.time()
+
+        threading.Thread(target=runner, daemon=True).start()
         return jsonify({"success": True, "job_id": job_id})
 
     @app.route("/api/jobs/<job_id>", methods=["GET"])
