@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "yosys2digitaljs": "^0.7.0"
+  }
+}

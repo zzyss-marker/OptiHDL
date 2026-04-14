@@ -474,8 +474,15 @@ function updateOptimizationResult(result) {
     originalCode.textContent = result.original_code || "--";
     originalCode.classList.add("collapsed");
     optimizedCode.textContent = result.optimized_code || "--";
+    optimizedCode.classList.add("collapsed");
     renderMetrics(result);
     renderAgentDecisions(result);
+
+    // Show circuit section and store codes for later generation
+    const circuitSection = document.getElementById("circuit-section");
+    circuitSection.style.display = "";
+    circuitSection._originalCode = result.original_code;
+    circuitSection._optimizedCode = result.optimized_code;
 
     const llmMode = result.llm_mode ? `，模式 ${result.llm_mode}` : "";
     setStatus(`优化完成${llmMode}`, "success");
@@ -523,5 +530,86 @@ async function optimizeCode() {
 btnAnalyze.addEventListener("click", analyzeCode);
 btnOptimize.addEventListener("click", optimizeCode);
 toggleOriginalBtn.addEventListener("click", toggleCodeCollapse);
+document.getElementById("toggle-optimized").addEventListener("click", () => {
+    optimizedCode.classList.toggle("collapsed");
+});
 btnSaveSettings.addEventListener("click", saveSettings);
+
+/* ─── Circuit simulation (DigitalJS) ─── */
+let circuitInstances = { original: null, optimized: null };
+
+async function fetchCircuitJson(code) {
+    const modMatch = code.match(/module\s+(\w+)/);
+    const moduleName = modMatch ? modMatch[1] : "top";
+    const response = await fetch("/api/circuit_json", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, module: moduleName }),
+    });
+    return response.json();
+}
+
+function renderCircuit(containerId, circuitJson) {
+    const container = document.getElementById(containerId);
+    container.textContent = "";
+    if (typeof digitaljs === "undefined") {
+        container.textContent = "DigitalJS library not loaded";
+        return null;
+    }
+    try {
+        const circuit = new digitaljs.Circuit(circuitJson);
+        const paper = circuit.displayOn($(container));
+        circuit.start();
+        return circuit;
+    } catch (e) {
+        container.textContent = "Circuit render error: " + e.message;
+        return null;
+    }
+}
+
+async function generateCircuits() {
+    const section = document.getElementById("circuit-section");
+    const origCode = section._originalCode;
+    const optCode = section._optimizedCode;
+    if (!origCode || !optCode) return;
+
+    const btn = document.getElementById("btn-gen-circuit");
+    btn.disabled = true;
+    btn.textContent = "生成中…";
+
+    // Clean up previous instances
+    if (circuitInstances.original) { circuitInstances.original.stop(); circuitInstances.original = null; }
+    if (circuitInstances.optimized) { circuitInstances.optimized.stop(); circuitInstances.optimized = null; }
+    document.getElementById("circuit-original").textContent = "加载中…";
+    document.getElementById("circuit-optimized").textContent = "加载中…";
+
+    try {
+        const [origResult, optResult] = await Promise.all([
+            fetchCircuitJson(origCode),
+            fetchCircuitJson(optCode),
+        ]);
+
+        if (origResult.success) {
+            circuitInstances.original = renderCircuit("circuit-original", origResult.output);
+        } else {
+            document.getElementById("circuit-original").textContent = origResult.error || "Failed";
+        }
+
+        if (optResult.success) {
+            circuitInstances.optimized = renderCircuit("circuit-optimized", optResult.output);
+        } else {
+            document.getElementById("circuit-optimized").textContent = optResult.error || "Failed";
+        }
+
+        addLogEntry("电路仿真图已生成", "success");
+    } catch (err) {
+        addLogEntry(`电路图生成失败: ${err.message}`, "error");
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "生成电路图";
+    }
+}
+
+document.getElementById("btn-gen-circuit").addEventListener("click", generateCircuits);
+
 loadSettings();

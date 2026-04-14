@@ -1,5 +1,5 @@
 # ── OptiHDL Docker Image ──
-# Complete EDA environment: Yosys (synthesis) + OpenSTA (timing analysis)
+# Complete EDA environment: Yosys + OpenSTA + Node.js (DigitalJS)
 FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,7 +10,7 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
-# ── Stage 1: System deps + Yosys ──
+# ── Stage 1: System deps + Yosys + Node.js ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
@@ -35,7 +35,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN yosys -V
 
-# ── Stage 2: Build OpenSTA from source ──
+# ── Stage 2: Node.js 20 LTS (for yosys2digitaljs) ──
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN node -v && npm -v
+
+# ── Stage 3: Build OpenSTA from source ──
 RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
     && mkdir /tmp/OpenSTA/build \
     && cd /tmp/OpenSTA/build \
@@ -44,10 +51,10 @@ RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp
     && make install \
     && rm -rf /tmp/OpenSTA
 
-# Verify both EDA tools
+# Verify EDA tools
 RUN yosys -V && sta -version
 
-# ── Stage 3: Python environment ──
+# ── Stage 4: Python environment ──
 RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip3 config set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
@@ -56,7 +63,11 @@ RUN pip3 install --no-cache-dir --upgrade pip
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# ── Stage 4: Application ──
+# ── Stage 5: DigitalJS bridge (Node.js deps) ──
+COPY tools/package.json /app/tools/
+RUN cd /app/tools && npm install --production
+
+# ── Stage 6: Application ──
 COPY . /app/
 
 RUN mkdir -p /app/models /app/data /app/logs /app/outputs /app/temp

@@ -324,10 +324,17 @@ class Evaluator:
     def evaluate(self, code: str, module_name: str) -> Dict[str, Any]:
         return analyze_verilog_api(code, module_name)
 
+    def check_equivalence(
+        self, original_code: str, candidate_code: str, module_name: str,
+    ) -> bool:
+        """Return True if candidate is functionally equivalent to original."""
+        return self.eda.check_equivalence(original_code, candidate_code, module_name)
+
     def score(self, metrics: Dict[str, Any], weights: Dict[str, Any]) -> float:
-        area_w = float(weights.get("area", 0.45))
-        ff_w = float(weights.get("ff", 0.35))
-        depth_w = float(weights.get("depth", 0.20))
+        area_w = float(weights.get("area", 0.40))
+        ff_w = float(weights.get("ff", 0.30))
+        depth_w = float(weights.get("depth", 0.15))
+        timing_w = float(weights.get("timing", 0.15))
         pass_w = float(weights.get("pass_bonus", 0.10))
 
         pass_bonus = 0.0
@@ -342,10 +349,19 @@ class Evaluator:
         ff = max(0.0, float(metrics.get("num_ff", 0)))
         depth = max(0.0, float(metrics.get("logic_depth", 0)))
 
+        # WNS: positive = timing met, negative = violation
+        wns = metrics.get("wns")
+        if wns is not None:
+            timing_score = 1.0 / (1.0 + max(0.0, -float(wns)) / 5.0)
+        else:
+            # OpenSTA not available — timing is neutral (0.5)
+            timing_score = 0.5
+
         return (
             area_w * (1.0 / (1.0 + area / 1000.0))
             + ff_w * (1.0 / (1.0 + ff / 1000.0))
             + depth_w * (1.0 / (1.0 + depth / 10.0))
+            + timing_w * timing_score
             + pass_w * pass_bonus
         )
 
@@ -721,6 +737,18 @@ class AgentOptimizer:
                 })
 
                 if score > iter_best_score:
+                    # Equivalence gate: only accept if functionally equivalent
+                    equiv_ok = evaluator.check_equivalence(
+                        input_code, candidate, ref_module,
+                    )
+                    if not equiv_ok:
+                        logger.info(
+                            f"Candidate {ci} iter {iteration}: score {score:.4f} "
+                            f"but FAILED equivalence check — rejected"
+                        )
+                        optimization_history[-1]["equiv_rejected"] = True
+                        continue
+
                     iter_best_score = score
                     iter_best_code = candidate
                     iter_best_metrics = metrics

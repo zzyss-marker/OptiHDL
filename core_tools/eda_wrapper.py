@@ -41,8 +41,7 @@ class EDAWrapper:
             包含所有 PPA 指标的字典
         """
         try:
-            # 禁用日志输出
-            # 1. 语法检查和综合（仅使用 Yosys 指标）
+            # 1. 语法检查和综合（Yosys 指标）
             synth_result = self._run_yosys_synthesis(verilog_code, module_name)
 
             # 2. 直接返回 Yosys 指标
@@ -53,8 +52,20 @@ class EDAWrapper:
             for field in required_fields:
                 if field not in result:
                     raise EDAFailure(f"缺少必需字段: {field}")
-            
-            # 禁用日志输出
+
+            # 4. 时序分析（OpenSTA，可选 — sta 不可用时优雅跳过）
+            if result.get("synth_ok") and self._has_opensta():
+                try:
+                    timing = self._run_opensta_timing(verilog_code, module_name, target_freq)
+                    result["wns"] = timing.get("wns")
+                    result["tns"] = timing.get("tns")
+                except Exception:
+                    result["wns"] = None
+                    result["tns"] = None
+            else:
+                result["wns"] = None
+                result["tns"] = None
+
             return result
             
         except Exception as e:
@@ -472,6 +483,11 @@ report_tns
                     except Exception:
                         continue
         return None
+
+    def _has_opensta(self) -> bool:
+        """Check whether the OpenSTA `sta` binary is available on PATH."""
+        import shutil
+        return shutil.which(self.opensta_path) is not None
 
     def _find_liberty(self) -> Optional[str]:
         """自动查找可用的liberty库文件路径。

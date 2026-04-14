@@ -285,6 +285,37 @@ def create_app() -> Flask:
     def api_job_status(job_id: str):
         return job_response(job_id)
 
+    @app.route("/api/circuit_json", methods=["POST"])
+    def api_circuit_json():
+        """Convert Verilog to DigitalJS JSON via yosys2digitaljs."""
+        import subprocess as _sp
+        payload = request.get_json(force=True)
+        code = payload.get("code", "")
+        module_name = payload.get("module", "top")
+        if not code.strip():
+            return jsonify({"success": False, "error": "No code provided"}), 400
+
+        tools_dir = PROJECT_ROOT / "tools"
+        script = tools_dir / "yosys2djs.js"
+        if not script.exists():
+            return jsonify({"success": False, "error": "yosys2djs.js not found"}), 500
+
+        import json as _json
+        try:
+            proc = _sp.run(
+                ["node", str(script)],
+                input=_json.dumps({"code": code, "module": module_name}),
+                capture_output=True, text=True, timeout=60,
+            )
+            result = _json.loads(proc.stdout)
+            return jsonify(result)
+        except FileNotFoundError:
+            return jsonify({"success": False, "error": "Node.js not installed"}), 500
+        except _sp.TimeoutExpired:
+            return jsonify({"success": False, "error": "Circuit generation timed out"}), 504
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+
     @app.errorhandler(Exception)
     def handle_api_exception(exc):  # noqa: ANN001
         if request.path.startswith("/api/"):
