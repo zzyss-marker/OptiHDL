@@ -46,7 +46,7 @@ RUN node -v && npm -v
 RUN git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenSTA.git /tmp/OpenSTA \
     && mkdir /tmp/OpenSTA/build \
     && cd /tmp/OpenSTA/build \
-    && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTING=OFF \
     && make -j"$(nproc)" \
     && make install \
     && rm -rf /tmp/OpenSTA
