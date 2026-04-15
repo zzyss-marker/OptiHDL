@@ -140,7 +140,26 @@ def create_app() -> Flask:
     runtime_settings = load_runtime_settings()
     apply_runtime_settings(runtime_settings)
     jobs: dict[str, dict] = {}
-    circuit_cache: dict[str, dict] = {}  # id → {"json": ..., "label": ..., "created": ...}
+
+    # Circuit cache — file-based so it survives worker restarts
+    _circuit_dir = PROJECT_ROOT / "temp" / "circuits"
+    _circuit_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_circuit(cid: str, data: dict) -> None:
+        import json as _j
+        (_circuit_dir / f"{cid}.json").write_text(
+            _j.dumps(data, ensure_ascii=False), encoding="utf-8",
+        )
+
+    def _load_circuit(cid: str) -> dict | None:
+        import json as _j
+        p = _circuit_dir / f"{cid}.json"
+        if not p.exists():
+            return None
+        try:
+            return _j.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
     def start_job(job_type: str, target_fn, *args):
         job_id = uuid.uuid4().hex
@@ -316,13 +335,13 @@ def create_app() -> Flask:
             if not result.get("success"):
                 return jsonify(result), 500
 
-            # Cache the circuit JSON and return an ID
+            # Cache the circuit JSON to disk and return an ID
             cid = uuid.uuid4().hex[:12]
-            circuit_cache[cid] = {
+            _save_circuit(cid, {
                 "json": result.get("output", {}),
                 "label": label,
                 "created": time.time(),
-            }
+            })
             return jsonify({"success": True, "circuit_id": cid})
         except FileNotFoundError:
             return jsonify({"success": False, "error": "Node.js not installed"}), 500
@@ -334,7 +353,7 @@ def create_app() -> Flask:
     @app.route("/api/circuit_data/<cid>", methods=["GET"])
     def api_circuit_data(cid: str):
         """Return cached circuit JSON for the viewer page."""
-        entry = circuit_cache.get(cid)
+        entry = _load_circuit(cid)
         if not entry:
             return jsonify({"success": False, "error": "Circuit not found or expired"}), 404
         return jsonify({"success": True, "circuit": entry["json"], "label": entry["label"]})
@@ -342,7 +361,7 @@ def create_app() -> Flask:
     @app.route("/circuit/<cid>")
     def circuit_viewer(cid: str):
         """Standalone circuit viewer page."""
-        entry = circuit_cache.get(cid)
+        entry = _load_circuit(cid)
         if not entry:
             return "Circuit not found or expired", 404
         return render_template("circuit.html", circuit_id=cid, label=entry["label"])
